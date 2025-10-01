@@ -60,7 +60,7 @@ class DirectoryEntry:
         name_field = name_bytes + b'\x00\x00' + b'\x00' * (64 - len(name_bytes) - 2)
 
         entry = struct.pack(
-            '<64sHBBIII16sIQQIIQ',
+            '<64sHBBIII16sIQQII',
             name_field,              # 64 bytes: name in UTF-16LE
             name_len,                # 2 bytes: name length including terminator
             self.entry_type,         # 1 byte: entry type
@@ -73,9 +73,11 @@ class DirectoryEntry:
             self.creation_time,      # 8 bytes: creation time
             self.modified_time,      # 8 bytes: modified time
             self.starting_sector,    # 4 bytes: starting sector
-            0,                       # 4 bytes: stream size low (we use 64-bit below)
-            self.stream_size         # 8 bytes: stream size (last 4 bytes in v4, full 8 in practice)
+            self.stream_size & 0xFFFFFFFF  # 4 bytes: stream size (low 32 bits for v3)
         )
+        # Pad to 128 bytes (entry is currently 120 bytes, need 8 more)
+        entry += struct.pack('<I', (self.stream_size >> 32) & 0xFFFFFFFF)  # High 32 bits (for v4)
+        entry += b'\x00' * 4  # Reserved
 
         # Ensure exactly 128 bytes
         return entry[:128]
@@ -103,25 +105,26 @@ class CFBWriter:
 
         # Create root entry (always at index 0)
         root = DirectoryEntry("Root Entry", EntryType.ROOT)
+        # starting_sector will be set later if we have mini streams
         self.directory_entries.append(root)
 
     def add_storage(self, name: str, parent_did: int = 0) -> int:
         """Add a storage (directory) entry"""
         entry = DirectoryEntry(name, EntryType.STORAGE)
+        entry.starting_sector = SectorType.ENDOFCHAIN  # Storages have no data stream
         did = len(self.directory_entries)
         self.directory_entries.append(entry)
 
-        # Link to parent's child chain
+        # Link to parent's child chain (simplified - just use child pointer)
         parent = self.directory_entries[parent_did]
         if parent.child == DirectoryEntry.NOSTREAM:
             parent.child = did
         else:
-            # Add as sibling
+            # Add as right sibling of the first child
             sibling_did = parent.child
             while self.directory_entries[sibling_did].right_sibling != DirectoryEntry.NOSTREAM:
                 sibling_did = self.directory_entries[sibling_did].right_sibling
             self.directory_entries[sibling_did].right_sibling = did
-            entry.left_sibling = sibling_did
 
         return did
 
@@ -133,17 +136,16 @@ class CFBWriter:
         self.directory_entries.append(entry)
         self.streams[did] = data
 
-        # Link to parent's child chain
+        # Link to parent's child chain (simplified - just use child pointer)
         parent = self.directory_entries[parent_did]
         if parent.child == DirectoryEntry.NOSTREAM:
             parent.child = did
         else:
-            # Add as sibling
+            # Add as right sibling of the first child
             sibling_did = parent.child
             while self.directory_entries[sibling_did].right_sibling != DirectoryEntry.NOSTREAM:
                 sibling_did = self.directory_entries[sibling_did].right_sibling
             self.directory_entries[sibling_did].right_sibling = did
-            entry.left_sibling = sibling_did
 
         return did
 
@@ -205,28 +207,39 @@ class CFBWriter:
         """Write CFB structure to binary stream"""
         # Build sector allocation for all streams
         stream_sectors = {}
+
         for did, data in self.streams.items():
             entry = self.directory_entries[did]
 
+            if not data:
+                entry.starting_sector = SectorType.ENDOFCHAIN
+                continue
+
+            # Decide whether to use mini stream or regular sectors
             if len(data) < self.MINI_STREAM_CUTOFF:
-                # Use mini stream
+                # Use mini stream for small data
                 mini_sectors = self._allocate_mini_sectors_for_data(data)
                 if mini_sectors:
                     entry.starting_sector = mini_sectors[0]
             else:
-                # Use regular sectors
+                # Use regular sectors for large data
                 sectors = self._allocate_sectors_for_data(data)
                 if sectors:
                     entry.starting_sector = sectors[0]
                     stream_sectors[did] = (data, sectors)
 
-        # Store mini stream in root entry if we have mini streams
+        # Store mini stream data in root entry if we have any
         if self.mini_stream_data:
+            # Mini stream is stored as a regular stream
             mini_stream_sectors = self._allocate_sectors_for_data(bytes(self.mini_stream_data))
             if mini_stream_sectors:
                 self.directory_entries[0].starting_sector = mini_stream_sectors[0]
                 self.directory_entries[0].stream_size = len(self.mini_stream_data)
                 stream_sectors[-1] = (bytes(self.mini_stream_data), mini_stream_sectors)
+        else:
+            # No mini stream
+            self.directory_entries[0].starting_sector = SectorType.ENDOFCHAIN
+            self.directory_entries[0].stream_size = 0
 
         # Allocate sectors for directory entries
         dir_data = b''.join(entry.to_bytes() for entry in self.directory_entries)
@@ -235,13 +248,14 @@ class CFBWriter:
         dir_sectors = self._allocate_sectors_for_data(dir_data)
         stream_sectors[-2] = (dir_data, dir_sectors)
 
-        # Allocate sectors for Mini FAT if needed
+        # Allocate sectors for Mini FAT if we have mini streams
         mini_fat_start_sector = SectorType.ENDOFCHAIN
         num_mini_fat_sectors = 0
         if self.mini_fat:
             mini_fat_data = struct.pack(f'<{len(self.mini_fat)}I', *self.mini_fat)
             # Pad to sector boundary
-            mini_fat_data += b'\xFF' * ((self.sector_size - (len(mini_fat_data) % self.sector_size)) % self.sector_size)
+            padding_needed = (self.sector_size - (len(mini_fat_data) % self.sector_size)) % self.sector_size
+            mini_fat_data += struct.pack(f'<{padding_needed // 4}I', *([SectorType.FREESECT] * (padding_needed // 4)))
             mini_fat_sectors = self._allocate_sectors_for_data(mini_fat_data)
             if mini_fat_sectors:
                 mini_fat_start_sector = mini_fat_sectors[0]
