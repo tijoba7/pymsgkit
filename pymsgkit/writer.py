@@ -198,6 +198,9 @@ class MSGWriter:
         for idx, attachment in enumerate(self.attachments):
             self._write_attachment(idx, attachment)
 
+        # Write named properties structure (required by some readers even if empty)
+        self._write_named_properties()
+
         # Write CFB to file
         self.cfb.write(filepath)
 
@@ -373,3 +376,27 @@ class MSGWriter:
                 stream_name = prop.get_stream_name()
                 stream_data = prop.encode_value()
                 self.cfb.add_stream(stream_name, stream_data, storage_did)
+
+    def _write_named_properties(self):
+        """
+        Write __nameid_version1.0 storage with required streams.
+        This is required by some MSG readers even if we don't use named properties.
+        Creates minimal valid structure.
+        """
+        # Create __nameid_version1.0 storage
+        nameid_storage = self.cfb.add_storage("__nameid_version1.0")
+
+        # GUID stream (__substg1.0_00020102) - stores property set GUIDs (16 bytes each)
+        # Add a placeholder GUID (PS_MAPI - all zeros is valid but unused)
+        guid_stream = b'\x00' * 16  # One GUID (all zeros = PS_MAPI placeholder)
+        self.cfb.add_stream("__substg1.0_00020102", guid_stream, nameid_storage)
+
+        # Entry stream (__substg1.0_00030102) - stores named property entries
+        # Format per entry: 4 bytes (name offset/id) + 2 bytes (GUID index) + 2 bytes (property type/kind)
+        # Add one placeholder entry
+        entry_stream = struct.pack('<I', 0) + struct.pack('<H', 0) + struct.pack('<H', 0)  # 8 bytes
+        self.cfb.add_stream("__substg1.0_00030102", entry_stream, nameid_storage)
+
+        # String stream (__substg1.0_00040102) - stores string names (optional)
+        # Only needed if we have string-named properties
+        # We can skip this for now as it's optional

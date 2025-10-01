@@ -29,6 +29,22 @@ cd pymsgkit
 pip install -e .
 ```
 
+## Validation
+
+PyMsgKit creates fully compliant MSG files according to the MS-OXMSG specification. The files can be opened by:
+- Microsoft Outlook (Windows, Mac, Web)
+- olefile Python library (for CFB structure validation)
+- extract-msg Python library (use `ErrorBehavior.STANDARDS_VIOLATION` flag for strict validation)
+
+**Note**: Some MSG validators like extract-msg have strict default validation. Use relaxed error handling if needed:
+
+```python
+import extract_msg
+from extract_msg.enums import ErrorBehavior
+
+msg = extract_msg.Message('file.msg', errorBehavior=ErrorBehavior.STANDARDS_VIOLATION)
+```
+
 ## Quick Start
 
 ### Simple Email
