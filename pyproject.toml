@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pymsgkit"
+version = "1.0.0"
+description = "Pure Python library for creating Outlook MSG files"
+readme = "README.md"
+requires-python = ">=3.7"
+license = {text = "MIT"}
+keywords = ["msg", "outlook", "email", "mapi", "ediscovery", "forensics"]
+authors = [
+  {name = "PyMsgKit Contributors"}
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/pymsgkit"
+Documentation = "https://github.com/yourusername/pymsgkit#readme"
+Repository = "https://github.com/yourusername/pymsgkit"
+Issues = "https://github.com/yourusername/pymsgkit/issues"
