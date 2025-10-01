@@ -36,6 +36,12 @@ class PropertyTag:
     PR_BODY_CONTENT_LOCATION = 0x1014
     PR_BODY_CONTENT_ID = 0x1015
 
+    # Internet Headers and Message ID
+    PR_TRANSPORT_MESSAGE_HEADERS = 0x007D
+    PR_INTERNET_MESSAGE_ID = 0x1035
+    PR_IN_REPLY_TO_ID = 0x1042
+    PR_INTERNET_REFERENCES = 0x1039
+
     # Sender Properties
     PR_SENDER_NAME = 0x0C1A
     PR_SENDER_EMAIL_ADDRESS = 0x0C1F
@@ -88,6 +94,26 @@ class PropertyTag:
     PR_STORE_RECORD_KEY = 0x0FFA
     PR_STORE_ENTRYID = 0x0FFB
     PR_OBJECT_TYPE_PROP = 0x0FFE
+
+    # Exchange Server Properties
+    PR_HASATTACH = 0x0E1B
+    PR_MESSAGE_CODEPAGE = 0x3FFD
+    PR_INTERNET_CPID = 0x3FDE
+    PR_MESSAGE_LOCALE_ID = 0x3FF1
+    PR_CREATOR_NAME = 0x3FF8
+    PR_CREATOR_ENTRYID = 0x3FF9
+    PR_LAST_MODIFIER_NAME = 0x3FFA
+    PR_LAST_MODIFIER_ENTRYID = 0x3FFB
+
+    # Additional Message Properties
+    PR_READ_RECEIPT_REQUESTED = 0x0029
+    PR_ORIGINATOR_DELIVERY_REPORT_REQUESTED = 0x0023
+    PR_REPLY_RECIPIENT_ENTRIES = 0x004F
+    PR_REPLY_RECIPIENT_NAMES = 0x0050
+
+    # Message Status
+    PR_MSG_STATUS = 0x0E17
+    PR_MESSAGE_FLAGS_2 = 0x0E17
 
 
 class Property:
@@ -290,3 +316,86 @@ def create_search_key(addr_type: str, email: str) -> bytes:
     """
     search_key_str = f"{addr_type}:{email}".upper()
     return search_key_str.encode('ascii') + b'\x00'
+
+
+def generate_message_id(domain: str = "pymsgkit.local") -> str:
+    """
+    Generate a unique RFC 5322 compliant Message-ID.
+    Format: <uniquestring@domain>
+    """
+    import uuid
+    import time
+
+    # Create unique ID using timestamp and UUID
+    timestamp = int(time.time() * 1000000)
+    unique_id = uuid.uuid4().hex[:16]
+
+    return f"<{timestamp}.{unique_id}@{domain}>"
+
+
+def generate_internet_headers(subject: str, sender_email: str, sender_name: str,
+                              to_recipients: list, cc_recipients: list = None,
+                              message_id: str = None, date: datetime = None) -> str:
+    """
+    Generate RFC 5322 compliant internet message headers.
+    These headers make the MSG file more compatible with online viewers.
+    """
+    if message_id is None:
+        # Extract domain from sender email
+        domain = sender_email.split('@')[1] if '@' in sender_email else 'pymsgkit.local'
+        message_id = generate_message_id(domain)
+
+    if date is None:
+        date = datetime.now(timezone.utc)
+
+    # Format date as RFC 5322
+    # Example: Mon, 2 Oct 2025 14:30:00 +0000
+    date_str = date.strftime('%a, %d %b %Y %H:%M:%S %z')
+    if not date_str.endswith('+0000') and not date_str.endswith('-'):
+        date_str += ' +0000'
+
+    # Build headers
+    headers = []
+    headers.append(f"Date: {date_str}")
+
+    # From header
+    if sender_name:
+        headers.append(f"From: \"{sender_name}\" <{sender_email}>")
+    else:
+        headers.append(f"From: {sender_email}")
+
+    # To header
+    to_list = []
+    for email, name in to_recipients:
+        if name:
+            to_list.append(f"\"{name}\" <{email}>")
+        else:
+            to_list.append(email)
+    if to_list:
+        headers.append(f"To: {', '.join(to_list)}")
+
+    # CC header
+    if cc_recipients:
+        cc_list = []
+        for email, name in cc_recipients:
+            if name:
+                cc_list.append(f"\"{name}\" <{email}>")
+            else:
+                cc_list.append(email)
+        headers.append(f"Cc: {', '.join(cc_list)}")
+
+    # Subject
+    headers.append(f"Subject: {subject}")
+
+    # Message-ID
+    headers.append(f"Message-ID: {message_id}")
+
+    # MIME headers
+    headers.append("MIME-Version: 1.0")
+    headers.append("Content-Type: text/plain; charset=\"utf-8\"")
+    headers.append("Content-Transfer-Encoding: quoted-printable")
+
+    # X-Mailer
+    headers.append("X-Mailer: PyMsgKit")
+
+    return '\r\n'.join(headers) + '\r\n'

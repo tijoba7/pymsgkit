@@ -8,7 +8,9 @@ import os
 from datetime import datetime, timezone
 from typing import List, Dict, Optional
 from .cfb import CFBWriter
-from .properties import Property, PropertyTag, encode_property_value, create_entryid, create_search_key, datetime_to_filetime
+from .properties import (Property, PropertyTag, encode_property_value, create_entryid,
+                        create_search_key, datetime_to_filetime, generate_message_id,
+                        generate_internet_headers)
 from .types import RecipientType, PropertyType, AttachMethod
 
 
@@ -70,6 +72,17 @@ class MSGWriter:
         self.set_property(PropertyTag.PR_IMPORTANCE, PropertyType.PT_LONG, 1)  # Normal
         self.set_property(PropertyTag.PR_PRIORITY, PropertyType.PT_LONG, 0)    # Normal
         self.set_property(PropertyTag.PR_SENSITIVITY, PropertyType.PT_LONG, 0)  # None
+
+        # Exchange Server properties
+        self.set_property(PropertyTag.PR_HASATTACH, PropertyType.PT_BOOLEAN, False)
+        self.set_property(PropertyTag.PR_MESSAGE_CODEPAGE, PropertyType.PT_LONG, 65001)  # UTF-8
+        self.set_property(PropertyTag.PR_INTERNET_CPID, PropertyType.PT_LONG, 65001)  # UTF-8
+        self.set_property(PropertyTag.PR_MESSAGE_LOCALE_ID, PropertyType.PT_LONG, 0x0409)  # en-US
+
+        # Additional message properties
+        self.set_property(PropertyTag.PR_READ_RECEIPT_REQUESTED, PropertyType.PT_BOOLEAN, False)
+        self.set_property(PropertyTag.PR_ORIGINATOR_DELIVERY_REPORT_REQUESTED, PropertyType.PT_BOOLEAN, False)
+        self.set_property(PropertyTag.PR_MSG_STATUS, PropertyType.PT_LONG, 0)
 
     def set_property(self, tag: int, prop_type: PropertyType, value):
         """Set a MAPI property"""
@@ -181,8 +194,12 @@ class MSGWriter:
         flags = 0
         if self.attachments:
             flags |= 0x00000010  # MSGFLAG_HASATTACH
+            self.set_property(PropertyTag.PR_HASATTACH, PropertyType.PT_BOOLEAN, True)
         flags |= 0x00000001  # MSGFLAG_READ (default to read)
         self.set_property(PropertyTag.PR_MESSAGE_FLAGS, PropertyType.PT_LONG, flags)
+
+        # Generate and add internet headers for better compatibility
+        self._add_internet_headers()
 
         # Update display recipient properties
         self._update_display_recipients()
@@ -203,6 +220,48 @@ class MSGWriter:
 
         # Write CFB to file
         self.cfb.write(filepath)
+
+    def _add_internet_headers(self):
+        """Add internet message headers and Message-ID for compatibility"""
+        # Get sender info
+        sender_email = ""
+        sender_name = ""
+        if PropertyTag.PR_SENDER_EMAIL_ADDRESS in self.properties:
+            sender_email = self.properties[PropertyTag.PR_SENDER_EMAIL_ADDRESS].value
+        if PropertyTag.PR_SENDER_NAME in self.properties:
+            sender_name = self.properties[PropertyTag.PR_SENDER_NAME].value
+
+        # Get subject
+        subject = ""
+        if PropertyTag.PR_SUBJECT in self.properties:
+            subject = self.properties[PropertyTag.PR_SUBJECT].value
+
+        # Generate Message-ID
+        domain = sender_email.split('@')[1] if '@' in sender_email else 'pymsgkit.local'
+        message_id = generate_message_id(domain)
+        self.set_property(PropertyTag.PR_INTERNET_MESSAGE_ID, PropertyType.PT_STRING8, message_id)
+
+        # Collect recipients by type
+        to_recips = [(r['email'], r['name']) for r in self.recipients if r['type'] == RecipientType.TO]
+        cc_recips = [(r['email'], r['name']) for r in self.recipients if r['type'] == RecipientType.CC]
+
+        # Get timestamp
+        send_time = datetime.now(timezone.utc)
+        if PropertyTag.PR_CLIENT_SUBMIT_TIME in self.properties:
+            send_time = self.properties[PropertyTag.PR_CLIENT_SUBMIT_TIME].value
+
+        # Generate internet headers
+        if sender_email and to_recips:
+            headers = generate_internet_headers(
+                subject=subject,
+                sender_email=sender_email,
+                sender_name=sender_name,
+                to_recipients=to_recips,
+                cc_recipients=cc_recips if cc_recips else None,
+                message_id=message_id,
+                date=send_time
+            )
+            self.set_property(PropertyTag.PR_TRANSPORT_MESSAGE_HEADERS, PropertyType.PT_STRING8, headers)
 
     def _update_display_recipients(self):
         """Update PR_DISPLAY_TO, PR_DISPLAY_CC, PR_DISPLAY_BCC"""
