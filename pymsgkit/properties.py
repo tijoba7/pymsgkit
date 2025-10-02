@@ -97,6 +97,7 @@ class PropertyTag:
 
     # Exchange Server Properties
     PR_HASATTACH = 0x0E1B
+    PR_STORE_SUPPORT_MASK = 0x340D
     PR_MESSAGE_CODEPAGE = 0x3FFD
     PR_INTERNET_CPID = 0x3FDE
     PR_MESSAGE_LOCALE_ID = 0x3FF1
@@ -150,10 +151,11 @@ class Property:
             PropertyType.PT_ERROR
         )
 
-    def get_fixed_entry(self) -> bytes:
+    def get_entry(self) -> bytes:
         """
         Get the 16-byte entry for __properties_version1.0 stream.
-        Format: 4 bytes property tag + 4 bytes flags + 8 bytes value/size
+        Format: 4 bytes property tag + 4 bytes flags + 8 bytes value/size.
+        Variable-length properties store the size and reserved field.
         """
         prop_tag_combined = (self.prop_type << 16) | self.tag
         flags = 0  # Typically zero
@@ -161,16 +163,14 @@ class Property:
         if self.is_fixed_length():
             # Value fits directly in 8-byte field
             value_bytes = self.encode_value()
-            # Pad to 8 bytes
             value_bytes += b'\x00' * (8 - len(value_bytes))
             value_field = value_bytes[:8]
         else:
-            # Variable length - store size in value field
             encoded = self.encode_value()
             size = len(encoded)
-            value_field = struct.pack('<Q', size)
+            value_field = struct.pack('<I', size) + struct.pack('<I', 0)
 
-        return struct.pack('<II', prop_tag_combined, flags) + value_field
+        return struct.pack('<I', prop_tag_combined) + struct.pack('<I', flags) + value_field
 
 
 def encode_property_value(value: Any, prop_type: PropertyType) -> bytes:
