@@ -45,6 +45,13 @@ class MSGWriter:
             0  # Will be updated based on content
         )
 
+        # Enable Unicode support for all string properties
+        self.set_property(
+            PropertyTag.PR_STORE_SUPPORT_MASK,
+            PropertyType.PT_LONG,
+            0x00040000  # STORE_UNICODE_OK
+        )
+
         # Set timestamps
         now = datetime.now(timezone.utc)
         self.set_property(
@@ -289,17 +296,23 @@ class MSGWriter:
         # Build __properties_version1.0 stream
         properties_data = bytearray()
 
-        # Reserved header (8 bytes of zeros)
+        # Reserved block (8 bytes of zeros)
         properties_data.extend(b'\x00' * 8)
 
-        # Add all fixed-length property entries
+        # Recipient and attachment counts
+        recipient_count = len(self.recipients)
+        attachment_count = len(self.attachments)
+        properties_data.extend(struct.pack('<I', recipient_count))
+        properties_data.extend(struct.pack('<I', attachment_count))
+        properties_data.extend(struct.pack('<I', recipient_count))  # Next recipient ID
+        properties_data.extend(struct.pack('<I', attachment_count))  # Next attachment ID
+
+        # Add all property entries (fixed and variable length)
         for tag, prop in sorted(self.properties.items()):
-            if prop.is_fixed_length():
-                properties_data.extend(prop.get_fixed_entry())
+            properties_data.extend(prop.get_entry())
 
         # Write __properties_version1.0 stream
-        if properties_data:
-            self.cfb.add_stream("__properties_version1.0", bytes(properties_data))
+        self.cfb.add_stream("__properties_version1.0", bytes(properties_data))
 
         # Write variable-length property streams
         for tag, prop in self.properties.items():
@@ -345,8 +358,7 @@ class MSGWriter:
         # Write recipient __properties_version1.0
         recip_properties_data = bytearray(b'\x00' * 8)  # Reserved header
         for tag, prop in sorted(recip_props.items()):
-            if prop.is_fixed_length():
-                recip_properties_data.extend(prop.get_fixed_entry())
+            recip_properties_data.extend(prop.get_entry())
 
         self.cfb.add_stream("__properties_version1.0", bytes(recip_properties_data), storage_did)
 
@@ -424,8 +436,7 @@ class MSGWriter:
         # Write attachment __properties_version1.0
         attach_properties_data = bytearray(b'\x00' * 8)  # Reserved header
         for tag, prop in sorted(attach_props.items()):
-            if prop.is_fixed_length():
-                attach_properties_data.extend(prop.get_fixed_entry())
+            attach_properties_data.extend(prop.get_entry())
 
         self.cfb.add_stream("__properties_version1.0", bytes(attach_properties_data), storage_did)
 
