@@ -78,6 +78,7 @@ class MSGWriter:
         self.set_property(PropertyTag.PR_MESSAGE_CODEPAGE, PropertyType.PT_LONG, 65001)  # UTF-8
         self.set_property(PropertyTag.PR_INTERNET_CPID, PropertyType.PT_LONG, 65001)  # UTF-8
         self.set_property(PropertyTag.PR_MESSAGE_LOCALE_ID, PropertyType.PT_LONG, 0x0409)  # en-US
+        self.set_property(PropertyTag.PR_STORE_SUPPORT_MASK, PropertyType.PT_LONG, 0x00040000)
 
         # Additional message properties
         self.set_property(PropertyTag.PR_READ_RECEIPT_REQUESTED, PropertyType.PT_BOOLEAN, False)
@@ -239,7 +240,7 @@ class MSGWriter:
         # Generate Message-ID
         domain = sender_email.split('@')[1] if '@' in sender_email else 'pymsgkit.local'
         message_id = generate_message_id(domain)
-        self.set_property(PropertyTag.PR_INTERNET_MESSAGE_ID, PropertyType.PT_STRING8, message_id)
+        self.set_property(PropertyTag.PR_INTERNET_MESSAGE_ID, PropertyType.PT_UNICODE, message_id)
 
         # Collect recipients by type
         to_recips = [(r['email'], r['name']) for r in self.recipients if r['type'] == RecipientType.TO]
@@ -261,7 +262,7 @@ class MSGWriter:
                 message_id=message_id,
                 date=send_time
             )
-            self.set_property(PropertyTag.PR_TRANSPORT_MESSAGE_HEADERS, PropertyType.PT_STRING8, headers)
+            self.set_property(PropertyTag.PR_TRANSPORT_MESSAGE_HEADERS, PropertyType.PT_UNICODE, headers)
 
     def _update_display_recipients(self):
         """Update PR_DISPLAY_TO, PR_DISPLAY_CC, PR_DISPLAY_BCC"""
@@ -286,27 +287,38 @@ class MSGWriter:
 
     def _write_properties(self):
         """Write all message properties to CFB"""
-        # Build __properties_version1.0 stream
+        # Build __properties_version1.0 stream with 32-byte header
         properties_data = bytearray()
 
-        # Reserved header (8 bytes of zeros)
-        properties_data.extend(b'\x00' * 8)
+        recipient_count = len(self.recipients)
+        attachment_count = len(self.attachments)
 
-        # Add all fixed-length property entries
+        # 8-byte reserved block followed by counts and next IDs (per MS-OXMSG 2.4.1)
+        properties_data.extend(b'\x00' * 8)
+        properties_data.extend(struct.pack(
+            '<IIII',
+            recipient_count,
+            attachment_count,
+            recipient_count,
+            attachment_count
+        ))
+
+        variable_streams = []
+
+        # Add all property entries (fixed and variable)
         for tag, prop in sorted(self.properties.items()):
-            if prop.is_fixed_length():
-                properties_data.extend(prop.get_fixed_entry())
+            encoded_value = prop.encode_value()
+            properties_data.extend(prop.get_property_entry(encoded_value))
+
+            if not prop.is_fixed_length():
+                variable_streams.append((prop.get_stream_name(), encoded_value))
 
         # Write __properties_version1.0 stream
-        if properties_data:
-            self.cfb.add_stream("__properties_version1.0", bytes(properties_data))
+        self.cfb.add_stream("__properties_version1.0", bytes(properties_data))
 
         # Write variable-length property streams
-        for tag, prop in self.properties.items():
-            if not prop.is_fixed_length():
-                stream_name = prop.get_stream_name()
-                stream_data = prop.encode_value()
-                self.cfb.add_stream(stream_name, stream_data)
+        for stream_name, stream_data in variable_streams:
+            self.cfb.add_stream(stream_name, stream_data)
 
     def _write_recipient(self, idx: int, recipient: Dict):
         """Write recipient storage to CFB"""
@@ -344,18 +356,18 @@ class MSGWriter:
 
         # Write recipient __properties_version1.0
         recip_properties_data = bytearray(b'\x00' * 8)  # Reserved header
+        recip_variable_streams = []
         for tag, prop in sorted(recip_props.items()):
-            if prop.is_fixed_length():
-                recip_properties_data.extend(prop.get_fixed_entry())
+            encoded_value = prop.encode_value()
+            recip_properties_data.extend(prop.get_property_entry(encoded_value))
+            if not prop.is_fixed_length():
+                recip_variable_streams.append((prop.get_stream_name(), encoded_value))
 
         self.cfb.add_stream("__properties_version1.0", bytes(recip_properties_data), storage_did)
 
         # Write variable-length property streams
-        for tag, prop in recip_props.items():
-            if not prop.is_fixed_length():
-                stream_name = prop.get_stream_name()
-                stream_data = prop.encode_value()
-                self.cfb.add_stream(stream_name, stream_data, storage_did)
+        for stream_name, stream_data in recip_variable_streams:
+            self.cfb.add_stream(stream_name, stream_data, storage_did)
 
     def _write_attachment(self, idx: int, attachment: Dict):
         """Write attachment storage to CFB"""
@@ -423,18 +435,18 @@ class MSGWriter:
 
         # Write attachment __properties_version1.0
         attach_properties_data = bytearray(b'\x00' * 8)  # Reserved header
+        attach_variable_streams = []
         for tag, prop in sorted(attach_props.items()):
-            if prop.is_fixed_length():
-                attach_properties_data.extend(prop.get_fixed_entry())
+            encoded_value = prop.encode_value()
+            attach_properties_data.extend(prop.get_property_entry(encoded_value))
+            if not prop.is_fixed_length():
+                attach_variable_streams.append((prop.get_stream_name(), encoded_value))
 
         self.cfb.add_stream("__properties_version1.0", bytes(attach_properties_data), storage_did)
 
         # Write variable-length property streams
-        for tag, prop in attach_props.items():
-            if not prop.is_fixed_length():
-                stream_name = prop.get_stream_name()
-                stream_data = prop.encode_value()
-                self.cfb.add_stream(stream_name, stream_data, storage_did)
+        for stream_name, stream_data in attach_variable_streams:
+            self.cfb.add_stream(stream_name, stream_data, storage_did)
 
     def _write_named_properties(self):
         """

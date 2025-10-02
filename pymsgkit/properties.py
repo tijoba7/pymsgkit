@@ -100,6 +100,7 @@ class PropertyTag:
     PR_MESSAGE_CODEPAGE = 0x3FFD
     PR_INTERNET_CPID = 0x3FDE
     PR_MESSAGE_LOCALE_ID = 0x3FF1
+    PR_STORE_SUPPORT_MASK = 0x340D
     PR_CREATOR_NAME = 0x3FF8
     PR_CREATOR_ENTRYID = 0x3FF9
     PR_LAST_MODIFIER_NAME = 0x3FFA
@@ -125,12 +126,7 @@ class Property:
         self.value = value
 
     def get_stream_name(self) -> str:
-        """
-        Get the property stream name for CFB.
-        Format: __substg1.0_TTTTIIII
-        where TTTT = property tag (4 hex digits)
-              IIII = property type (4 hex digits)
-        """
+        """Return the CFB stream name for this property"""
         return f"__substg1.0_{self.tag:04X}{self.prop_type:04X}"
 
     def encode_value(self) -> bytes:
@@ -138,7 +134,7 @@ class Property:
         return encode_property_value(self.value, self.prop_type)
 
     def is_fixed_length(self) -> bool:
-        """Check if property is fixed-length (fits in 8 bytes)"""
+        """Check if property value fits in the 8-byte inline field"""
         return self.prop_type in (
             PropertyType.PT_SHORT,
             PropertyType.PT_LONG,
@@ -150,25 +146,19 @@ class Property:
             PropertyType.PT_ERROR
         )
 
-    def get_fixed_entry(self) -> bytes:
-        """
-        Get the 16-byte entry for __properties_version1.0 stream.
-        Format: 4 bytes property tag + 4 bytes flags + 8 bytes value/size
-        """
-        prop_tag_combined = (self.prop_type << 16) | self.tag
-        flags = 0  # Typically zero
+    def get_property_entry(self, encoded_value: bytes) -> bytes:
+        """Build the 16-byte property stream entry for this property"""
+        # According to MS-OXMSG the property tag is PropertyID << 16 | PropertyType
+        prop_tag_combined = (self.tag << 16) | (self.prop_type & 0xFFFF)
+        flags = 0  # Reserved/unused in normal MSG creation
 
         if self.is_fixed_length():
-            # Value fits directly in 8-byte field
-            value_bytes = self.encode_value()
-            # Pad to 8 bytes
-            value_bytes += b'\x00' * (8 - len(value_bytes))
-            value_field = value_bytes[:8]
+            # Fixed values are stored inline and zero padded to 8 bytes
+            value_field = (encoded_value + (b'\x00' * 8))[:8]
         else:
-            # Variable length - store size in value field
-            encoded = self.encode_value()
-            size = len(encoded)
-            value_field = struct.pack('<Q', size)
+            # Variable length stores size (DWORD) + reserved DWORD
+            size = len(encoded_value)
+            value_field = struct.pack('<II', size, 0)
 
         return struct.pack('<II', prop_tag_combined, flags) + value_field
 
