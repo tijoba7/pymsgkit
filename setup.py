@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="pymsgkit",
-    version="1.2.0",
+    version="1.3.0",
     author="PyMsgKit Contributors",
     author_email="your.email@example.com",
     description="Pure Python library for creating Outlook MSG files (plus EML/MBOX export)",

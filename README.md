@@ -233,24 +233,37 @@ conversation GUID, so files differ run to run.
 
 #### Compatibility & validation
 
-Output is validated in CI against two independent parsers:
+Output is validated against multiple independent checks:
 
 - **olefile** — confirms a well-formed Compound File Binary container
 - **extract-msg** (the de-facto forensic MSG library) — opens the files in its
   **strict** default mode and reads back subject, sender, recipients (with
-  correct To/Cc/Bcc types), body, attachments, and timestamps
+  correct To/Cc/Bcc types), body, RTF body, attachments, and timestamps
+- **MS-CFB red-black tree invariants** — the directory tree is verified to be
+  BST-ordered and red-black-valid, which is exactly what the Windows
+  Structured Storage implementation (and therefore Outlook/MAPI) requires
+
+For Windows/Outlook compatibility specifically, PyMsgKit:
+
+- builds the CFB directory as a proper **red-black tree** (Windows rejects the
+  degenerate sibling chains that lenient parsers tolerate);
+- fills unused directory slots with valid EMPTY entries (not `0xFF` filler);
+- writes full **MS-OXCDATA one-off EntryIDs** for sender/recipients;
+- emits an uncompressed **`PR_RTF_COMPRESSED`** body for plain-text messages;
+- represents "no named properties" as three empty `__nameid` streams rather
+  than a phantom placeholder entry.
 
 Large messages are supported: attachments beyond the ~7 MB single-FAT limit are
 written using a DIFAT chain (tested to 50 MB), so big evidence files don't
 silently corrupt.
 
-**Known limitations** (please verify against your own target tooling before
-relying on them in a matter):
+**Please still verify against your own target Outlook build before relying on
+output in a matter.** CI has no Windows image, so the Windows guarantees above
+come from conformance tests against the MS-CFB/MS-OXMSG specifications and the
+extract-msg parser, not from launching Outlook itself. Remaining notes:
 
-- Not tested against Outlook-on-Windows in CI (no Windows in the CI image);
-  validation is via olefile + extract-msg.
-- `EntryID` values are simplified rather than full MS-OXCDATA one-off EntryIDs.
-- RTF bodies (`PR_RTF_COMPRESSED`) are not generated; plain text and HTML are.
+- HTML messages display from `PR_HTML`; a plain RTF body is not layered on top
+  of HTML (doing so would override it). Encapsulated HTML-in-RTF is not generated.
 
 ### Automated Email Generation
 
@@ -384,6 +397,14 @@ MIT License - see LICENSE file for details
 - **Discussions**: [GitHub Discussions](https://github.com/yourusername/pymsgkit/discussions)
 
 ## Changelog
+
+### v1.3.0 (2026-07-01)
+- **Windows / Outlook compatibility**: build the CFB directory as a proper red-black tree (sorted by the MS-CFB name comparison). Windows Structured Storage rejects the degenerate sibling chains that olefile/extract-msg tolerate — this was the main reason files failed to open in Outlook on Windows.
+- Fill unused directory slots with valid EMPTY entries instead of `0xFF` filler (which Windows reads as invalid entries).
+- Write full **MS-OXCDATA one-off EntryIDs** (correct provider GUID + Unicode strings) for sender and recipients, replacing the previous simplified stub.
+- Generate an uncompressed **`PR_RTF_COMPRESSED`** body (MS-OXRTFCP 'MELA') for plain-text messages, with `PR_RTF_IN_SYNC`.
+- Represent "no named properties" as three empty `__nameid_version1.0` streams instead of a phantom placeholder entry.
+- Added 19 tests: MS-CFB red-black tree invariant validation (up to 128 siblings + real messages) and RTF body checks; suite now at 83 tests.
 
 ### v1.2.0 (2026-07-01)
 - **MSG spec-compliance fixes** (files now open in extract-msg's strict mode and other real MAPI parsers):

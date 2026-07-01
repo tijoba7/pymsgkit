@@ -33,6 +33,7 @@ class PropertyTag:
     PR_BODY = 0x1000
     PR_HTML = 0x1013
     PR_RTF_COMPRESSED = 0x1009
+    PR_RTF_IN_SYNC = 0x0E1F
     PR_BODY_CONTENT_LOCATION = 0x1014
     PR_BODY_CONTENT_ID = 0x1015
 
@@ -308,25 +309,85 @@ def filetime_to_datetime(filetime: int) -> datetime:
     return epoch + timedelta(seconds=seconds)
 
 
+# Provider UID for a One-Off EntryID (MS-OXCDATA 2.2.5.1):
+# {A41F2B81-A3BE-1019-9D6E-00DD010F5402}
+_ONE_OFF_PROVIDER_UID = bytes.fromhex('812B1FA4BEA310199D6E00DD010F5402')
+
+# Bit flags (2 bytes) for the one-off: MAPI_ONE_OFF_UNICODE (0x8000) means the
+# strings are UTF-16LE; MAPI_ONE_OFF_NO_RICH_INFO (0x0001) means plain text.
+_ONE_OFF_UNICODE = 0x8000
+_ONE_OFF_NO_RICH_INFO = 0x0001
+
+
 def create_entryid(email: str, display_name: str, addr_type: str = "SMTP") -> bytes:
     """
-    Create a simple EntryID for email address.
-    This is a simplified version - full implementation would follow MS-OXCDATA spec.
-    """
-    # Simplified one-off EntryID structure
-    # In practice, this should follow the full specification
-    flags = 0x00000000
-    provider_uid = b'\x00' * 16  # Simplified
-    version = 0
-    # Use UTF-8 with a safe fallback so non-ASCII names/addresses don't crash
-    # (common in eDiscovery / international mail).
-    addr_type_bytes = (addr_type + '\x00').encode('utf-8', errors='replace')
-    email_bytes = (email + '\x00').encode('utf-8', errors='replace')
-    display_bytes = (display_name + '\x00').encode('utf-8', errors='replace')
+    Create a One-Off EntryID for an email address per MS-OXCDATA 2.2.5.1.
 
-    return (struct.pack('<I', flags) + provider_uid +
-            struct.pack('<I', version) +
-            addr_type_bytes + email_bytes + display_bytes)
+    Layout: Flags(4) + ProviderUID(16) + Version(2) + BitFlags(2) +
+    DisplayName + AddressType + EmailAddress, each string UTF-16LE and
+    null-terminated (Unicode flag set).
+    """
+    flags = 0x00000000
+    version = 0x0000
+    bit_flags = _ONE_OFF_UNICODE | _ONE_OFF_NO_RICH_INFO
+
+    def u(s):
+        return (s or "").encode('utf-16le') + b'\x00\x00'
+
+    return (struct.pack('<I', flags) + _ONE_OFF_PROVIDER_UID +
+            struct.pack('<H', version) + struct.pack('<H', bit_flags) +
+            u(display_name) + u(addr_type) + u(email))
+
+
+def _rtf_escape(text: str) -> str:
+    """Escape plain text for inclusion in an RTF document body."""
+    out = []
+    for ch in text:
+        if ch == '\\':
+            out.append('\\\\')
+        elif ch == '{':
+            out.append('\\{')
+        elif ch == '}':
+            out.append('\\}')
+        elif ch == '\n':
+            out.append('\\par\n')
+        elif ch == '\r':
+            continue
+        elif ch == '\t':
+            out.append('\\tab ')
+        elif ord(ch) < 128:
+            out.append(ch)
+        else:
+            # \uN control word with a signed 16-bit value and a '?' ANSI fallback.
+            code = ord(ch)
+            if code > 0xFFFF:
+                code -= 0x10000
+                hi = 0xD800 + (code >> 10)
+                lo = 0xDC00 + (code & 0x3FF)
+                for unit in (hi, lo):
+                    out.append(f"\\u{unit if unit < 0x8000 else unit - 0x10000}?")
+            else:
+                out.append(f"\\u{code if code < 0x8000 else code - 0x10000}?")
+    return ''.join(out)
+
+
+def build_uncompressed_rtf(text: str) -> bytes:
+    """Build a PR_RTF_COMPRESSED stream holding *uncompressed* RTF.
+
+    MS-OXRTFCP allows an uncompressed payload identified by the 'MELA'
+    (0x414C454D) marker, which avoids implementing the LZ compressor while
+    still producing a valid RTF body that Outlook renders.
+    """
+    rtf = ("{\\rtf1\\ansi\\ansicpg1252\\fromtext\\deff0"
+           "{\\fonttbl{\\f0\\fswiss\\fcharset0 Arial;}}"
+           "\\pard\\plain\\f0\\fs20 " + _rtf_escape(text) + "\\par}")
+    rtf_bytes = rtf.encode('ascii', errors='replace')  # non-ASCII already \u-escaped
+
+    COMPTYPE_UNCOMPRESSED = 0x414C454D  # 'MELA'
+    raw_size = len(rtf_bytes)
+    comp_size = raw_size + 12  # number of bytes following the compSize field
+    header = struct.pack('<IIII', comp_size, raw_size, COMPTYPE_UNCOMPRESSED, 0)
+    return header + rtf_bytes
 
 
 def create_search_key(addr_type: str, email: str) -> bytes:

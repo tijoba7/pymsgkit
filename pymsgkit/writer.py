@@ -258,6 +258,9 @@ class MSGWriter:
         flags |= 0x00000001  # MSGFLAG_READ (default to read)
         self.set_property(PropertyTag.PR_MESSAGE_FLAGS, PropertyType.PT_LONG, flags)
 
+        # Synthesize an RTF body for plain-text messages (Outlook compatibility)
+        self._add_rtf_body()
+
         # Generate and add internet headers for better compatibility
         self._add_internet_headers()
 
@@ -294,6 +297,26 @@ class MSGWriter:
         """Return this message serialized as ``.eml`` bytes."""
         from .export import msg_to_eml_bytes
         return msg_to_eml_bytes(self)
+
+    def _add_rtf_body(self):
+        """Add an uncompressed RTF body derived from the plain-text body.
+
+        Only done for plain-text messages: HTML messages display from PR_HTML,
+        and layering a plain RTF body on top would override the HTML. A caller
+        that has already set PR_RTF_COMPRESSED explicitly is left untouched.
+        """
+        if PropertyTag.PR_HTML in self.properties:
+            return
+        if PropertyTag.PR_RTF_COMPRESSED in self.properties:
+            return
+        if PropertyTag.PR_BODY not in self.properties:
+            return
+
+        from .properties import build_uncompressed_rtf
+        text = self.properties[PropertyTag.PR_BODY].value or ""
+        self.set_property(PropertyTag.PR_RTF_COMPRESSED, PropertyType.PT_BINARY,
+                          build_uncompressed_rtf(text))
+        self.set_property(PropertyTag.PR_RTF_IN_SYNC, PropertyType.PT_BOOLEAN, True)
 
     def _add_internet_headers(self):
         """Add internet message headers and Message-ID for compatibility"""
@@ -525,24 +548,16 @@ class MSGWriter:
 
     def _write_named_properties(self):
         """
-        Write __nameid_version1.0 storage with required streams.
-        This is required by some MSG readers even if we don't use named properties.
-        Creates minimal valid structure.
+        Write the __nameid_version1.0 storage with its three required streams.
+
+        We do not emit any named properties, so the correct representation is an
+        empty mapping: all three streams present but zero-length. (Earlier
+        versions wrote a placeholder GUID and a dummy entry, which presents a
+        phantom named property that strict readers such as Outlook may reject.)
         """
-        # Create __nameid_version1.0 storage
         nameid_storage = self.cfb.add_storage("__nameid_version1.0")
 
-        # GUID stream (__substg1.0_00020102) - stores property set GUIDs (16 bytes each)
-        # Add a placeholder GUID (PS_MAPI - all zeros is valid but unused)
-        guid_stream = b'\x00' * 16  # One GUID (all zeros = PS_MAPI placeholder)
-        self.cfb.add_stream("__substg1.0_00020102", guid_stream, nameid_storage)
-
-        # Entry stream (__substg1.0_00030102) - stores named property entries
-        # Format per entry: 4 bytes (name offset/id) + 2 bytes (GUID index) + 2 bytes (property type/kind)
-        # Add one placeholder entry
-        entry_stream = struct.pack('<I', 0) + struct.pack('<H', 0) + struct.pack('<H', 0)  # 8 bytes
-        self.cfb.add_stream("__substg1.0_00030102", entry_stream, nameid_storage)
-
-        # String stream (__substg1.0_00040102) - stores string names (optional)
-        # Only needed if we have string-named properties
-        # We can skip this for now as it's optional
+        # GUID stream, entry stream, and string stream - all empty.
+        self.cfb.add_stream("__substg1.0_00020102", b"", nameid_storage)
+        self.cfb.add_stream("__substg1.0_00030102", b"", nameid_storage)
+        self.cfb.add_stream("__substg1.0_00040102", b"", nameid_storage)

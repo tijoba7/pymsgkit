@@ -85,10 +85,13 @@ def test_search_key_non_ascii_does_not_raise():
     assert key.endswith(b"\x00")
 
 
-def test_entryid_contains_addresses():
+def test_entryid_is_one_off_with_unicode_addresses():
     eid = create_entryid("user@x.com", "User Name", "SMTP")
-    assert b"user@x.com" in eid
-    assert b"SMTP" in eid
+    # One-Off EntryID provider UID (MS-OXCDATA 2.2.5.1).
+    assert eid[4:20] == bytes.fromhex('812B1FA4BEA310199D6E00DD010F5402')
+    # Strings are UTF-16LE with the Unicode flag set.
+    assert "user@x.com".encode("utf-16le") in eid
+    assert "SMTP".encode("utf-16le") in eid
 
 
 def test_entryid_non_ascii_does_not_raise():
