@@ -54,9 +54,10 @@ class DirectoryEntry:
 
     def to_bytes(self) -> bytes:
         """Serialize directory entry to 128 bytes"""
-        # Name as UTF-16LE, padded to 64 bytes
+        # Name as UTF-16LE, padded to 64 bytes. Unused (empty) entries report a
+        # name length of 0 per MS-CFB.
         name_bytes = self.name.encode('utf-16le')
-        name_len = len(name_bytes) + 2  # Include null terminator
+        name_len = len(name_bytes) + 2 if self.name else 0  # Include null terminator
         name_field = name_bytes + b'\x00\x00' + b'\x00' * (64 - len(name_bytes) - 2)
 
         entry = struct.pack(
@@ -102,6 +103,9 @@ class CFBWriter:
         self.fat: List[int] = []  # File Allocation Table
         self.mini_fat: List[int] = []  # Mini FAT for small streams
         self.mini_stream_data = bytearray()  # Mini stream container
+        # parent DID -> list of child DIDs. The actual sibling red-black tree is
+        # built at write time (see _finalize_directory_tree).
+        self.children: Dict[int, List[int]] = {0: []}
 
         # Create root entry (always at index 0)
         root = DirectoryEntry("Root Entry", EntryType.ROOT)
@@ -114,18 +118,8 @@ class CFBWriter:
         entry.starting_sector = SectorType.ENDOFCHAIN  # Storages have no data stream
         did = len(self.directory_entries)
         self.directory_entries.append(entry)
-
-        # Link to parent's child chain (simplified - just use child pointer)
-        parent = self.directory_entries[parent_did]
-        if parent.child == DirectoryEntry.NOSTREAM:
-            parent.child = did
-        else:
-            # Add as right sibling of the first child
-            sibling_did = parent.child
-            while self.directory_entries[sibling_did].right_sibling != DirectoryEntry.NOSTREAM:
-                sibling_did = self.directory_entries[sibling_did].right_sibling
-            self.directory_entries[sibling_did].right_sibling = did
-
+        self.children.setdefault(parent_did, []).append(did)
+        self.children.setdefault(did, [])
         return did
 
     def add_stream(self, name: str, data: bytes, parent_did: int = 0) -> int:
@@ -135,19 +129,146 @@ class CFBWriter:
         did = len(self.directory_entries)
         self.directory_entries.append(entry)
         self.streams[did] = data
-
-        # Link to parent's child chain (simplified - just use child pointer)
-        parent = self.directory_entries[parent_did]
-        if parent.child == DirectoryEntry.NOSTREAM:
-            parent.child = did
-        else:
-            # Add as right sibling of the first child
-            sibling_did = parent.child
-            while self.directory_entries[sibling_did].right_sibling != DirectoryEntry.NOSTREAM:
-                sibling_did = self.directory_entries[sibling_did].right_sibling
-            self.directory_entries[sibling_did].right_sibling = did
-
+        self.children.setdefault(parent_did, []).append(did)
         return did
+
+    # ------------------------------------------------------------------
+    # Directory red-black tree
+    #
+    # The Windows Structured Storage implementation (and therefore Outlook /
+    # MAPI) requires each storage's children to be arranged as a red-black tree
+    # whose in-order traversal is sorted by the MS-CFB name comparison: shorter
+    # names first, then a case-insensitive (uppercased) UTF-16 ordinal compare.
+    # A degenerate insertion-ordered chain is read by lenient parsers (olefile,
+    # extract-msg) but rejected by Windows, so we build a proper tree here.
+    # ------------------------------------------------------------------
+    def _name_sort_key(self, did: int):
+        name = self.directory_entries[did].name[:31]
+        return (len(name), name.upper())
+
+    def _cfb_less(self, a: int, b: int) -> bool:
+        return self._name_sort_key(a) < self._name_sort_key(b)
+
+    def _finalize_directory_tree(self):
+        NIL = DirectoryEntry.NOSTREAM
+        # Reset tree links; keep child only for containers (set below).
+        for entry in self.directory_entries:
+            entry.left_sibling = NIL
+            entry.right_sibling = NIL
+            entry.color = Color.BLACK
+            if entry.entry_type not in (EntryType.STORAGE, EntryType.ROOT):
+                entry.child = NIL
+        for parent_did in self.children:
+            kids = sorted(self.children[parent_did], key=self._name_sort_key)
+            self.directory_entries[parent_did].child = self._build_rb_tree(kids)
+
+    def _build_rb_tree(self, dids: List[int]) -> int:
+        """Insert dids into a red-black tree and write the links back onto the
+        directory entries. Returns the DID of the tree root (or NOSTREAM)."""
+        NIL = DirectoryEntry.NOSTREAM
+        if not dids:
+            return NIL
+
+        RED, BLACK = Color.RED, Color.BLACK
+        left, right, parent, color = {}, {}, {}, {}
+        root = [None]
+
+        def col(x):
+            return BLACK if x is None else color[x]
+
+        def rotate_left(x):
+            y = right[x]
+            right[x] = left[y]
+            if left[y] is not None:
+                parent[left[y]] = x
+            parent[y] = parent[x]
+            if parent[x] is None:
+                root[0] = y
+            elif x == left[parent[x]]:
+                left[parent[x]] = y
+            else:
+                right[parent[x]] = y
+            left[y] = x
+            parent[x] = y
+
+        def rotate_right(x):
+            y = left[x]
+            left[x] = right[y]
+            if right[y] is not None:
+                parent[right[y]] = x
+            parent[y] = parent[x]
+            if parent[x] is None:
+                root[0] = y
+            elif x == right[parent[x]]:
+                right[parent[x]] = y
+            else:
+                left[parent[x]] = y
+            right[y] = x
+            parent[x] = y
+
+        def fixup(z):
+            while col(parent.get(z)) == RED:
+                p = parent[z]
+                g = parent[p]
+                if p == left.get(g):
+                    u = right.get(g)
+                    if col(u) == RED:
+                        color[p] = BLACK
+                        color[u] = BLACK
+                        color[g] = RED
+                        z = g
+                    else:
+                        if z == right.get(p):
+                            z = p
+                            rotate_left(z)
+                            p = parent[z]
+                            g = parent[p]
+                        color[p] = BLACK
+                        color[g] = RED
+                        rotate_right(g)
+                else:
+                    u = left.get(g)
+                    if col(u) == RED:
+                        color[p] = BLACK
+                        color[u] = BLACK
+                        color[g] = RED
+                        z = g
+                    else:
+                        if z == left.get(p):
+                            z = p
+                            rotate_right(z)
+                            p = parent[z]
+                            g = parent[p]
+                        color[p] = BLACK
+                        color[g] = RED
+                        rotate_left(g)
+            color[root[0]] = BLACK
+
+        def insert(z):
+            left[z] = right[z] = None
+            color[z] = RED
+            y, x = None, root[0]
+            while x is not None:
+                y = x
+                x = left[x] if self._cfb_less(z, x) else right[x]
+            parent[z] = y
+            if y is None:
+                root[0] = z
+            elif self._cfb_less(z, y):
+                left[y] = z
+            else:
+                right[y] = z
+            fixup(z)
+
+        for did in dids:
+            insert(did)
+
+        for did in dids:
+            e = self.directory_entries[did]
+            e.left_sibling = NIL if left[did] is None else left[did]
+            e.right_sibling = NIL if right[did] is None else right[did]
+            e.color = color[did]
+        return root[0]
 
     def _allocate_sectors_for_data(self, data: bytes) -> List[int]:
         """Allocate sectors for data and build FAT chain"""
@@ -205,6 +326,10 @@ class CFBWriter:
 
     def _write_to_stream(self, f: BinaryIO):
         """Write CFB structure to binary stream"""
+        # Arrange every storage's children as a proper red-black tree so that
+        # strict readers (Windows Structured Storage / Outlook) accept the file.
+        self._finalize_directory_tree()
+
         # Build sector allocation for all streams
         stream_sectors = {}
 
@@ -241,10 +366,15 @@ class CFBWriter:
             self.directory_entries[0].starting_sector = SectorType.ENDOFCHAIN
             self.directory_entries[0].stream_size = 0
 
-        # Allocate sectors for directory entries
-        dir_data = b''.join(entry.to_bytes() for entry in self.directory_entries)
-        # Pad to sector boundary
-        dir_data += b'\xFF' * ((self.sector_size - (len(dir_data) % self.sector_size)) % self.sector_size)
+        # Allocate sectors for directory entries. Pad the final sector with
+        # proper EMPTY directory entries (object type 0, siblings = NOSTREAM)
+        # rather than 0xFF filler, which Windows treats as invalid entries.
+        entry_blobs = [entry.to_bytes() for entry in self.directory_entries]
+        entries_per_sector = self.sector_size // 128
+        pad = (entries_per_sector - (len(entry_blobs) % entries_per_sector)) % entries_per_sector
+        empty_entry = DirectoryEntry("", EntryType.EMPTY).to_bytes()
+        entry_blobs.extend([empty_entry] * pad)
+        dir_data = b''.join(entry_blobs)
         dir_sectors = self._allocate_sectors_for_data(dir_data)
         stream_sectors[-2] = (dir_data, dir_sectors)
 
@@ -262,20 +392,51 @@ class CFBWriter:
                 num_mini_fat_sectors = len(mini_fat_sectors)
                 stream_sectors[-3] = (mini_fat_data, mini_fat_sectors)
 
-        # Allocate sectors for FAT
-        # FAT includes entries for itself, so we need to calculate iteratively
-        fat_entries_per_sector = self.sector_size // 4
-        num_fat_sectors = (len(self.fat) + fat_entries_per_sector - 1) // fat_entries_per_sector
+        # Allocate sectors for the FAT (and DIFAT, if the file is large enough
+        # to need more than 109 FAT sectors). Every FAT and DIFAT sector is
+        # itself a sector the FAT must describe, so the counts are interdependent
+        # and solved with a small fixpoint loop.
+        fat_entries_per_sector = self.sector_size // 4          # 128 for 512-byte sectors
+        difat_entries_per_sector = fat_entries_per_sector - 1   # 127; last slot chains
+        HEADER_DIFAT_SLOTS = 109
 
-        # Add FAT sector entries to FAT
-        fat_sector_ids = []
-        for i in range(num_fat_sectors):
-            fat_sector_id = len(self.fat)
-            fat_sector_ids.append(fat_sector_id)
-            self.fat.append(SectorType.FATSECT)
+        content_sectors = len(self.fat)  # data / directory / mini-FAT sectors
+
+        num_fat_sectors = 0
+        num_difat_sectors = 0
+        while True:
+            total = content_sectors + num_fat_sectors + num_difat_sectors
+            new_fat = (total + fat_entries_per_sector - 1) // fat_entries_per_sector
+            overflow = max(0, new_fat - HEADER_DIFAT_SLOTS)
+            new_difat = (overflow + difat_entries_per_sector - 1) // difat_entries_per_sector
+            if new_fat == num_fat_sectors and new_difat == num_difat_sectors:
+                break
+            num_fat_sectors, num_difat_sectors = new_fat, new_difat
+
+        # Sector ids: FAT sectors first, then DIFAT sectors.
+        fat_sector_ids = list(range(content_sectors, content_sectors + num_fat_sectors))
+        difat_sector_ids = list(range(content_sectors + num_fat_sectors,
+                                      content_sectors + num_fat_sectors + num_difat_sectors))
+        total_sectors = content_sectors + num_fat_sectors + num_difat_sectors
+
+        # Extend the FAT to describe every sector, marking FAT/DIFAT sectors.
+        while len(self.fat) < total_sectors:
+            self.fat.append(SectorType.FREESECT)
+        for sid in fat_sector_ids:
+            self.fat[sid] = SectorType.FATSECT
+        for sid in difat_sector_ids:
+            self.fat[sid] = SectorType.DIFSECT
+
+        # The header holds the first 109 FAT locations; any overflow goes into
+        # the DIFAT sector chain.
+        header_fat_locs = fat_sector_ids[:HEADER_DIFAT_SLOTS]
+        overflow_fat_locs = fat_sector_ids[HEADER_DIFAT_SLOTS:]
+        difat_start = difat_sector_ids[0] if difat_sector_ids else SectorType.ENDOFCHAIN
 
         # Write header
-        self._write_header(f, dir_sectors[0], fat_sector_ids, mini_fat_start_sector, num_mini_fat_sectors)
+        self._write_header(f, dir_sectors[0], header_fat_locs, num_fat_sectors,
+                           mini_fat_start_sector, num_mini_fat_sectors,
+                           difat_start, num_difat_sectors)
 
         # Write all sectors in order
         # Collect all sectors by ID
@@ -294,19 +455,32 @@ class CFBWriter:
         # Add FAT sectors
         fat_data = struct.pack(f'<{len(self.fat)}I', *self.fat)
         # Pad to fill all FAT sectors
-        fat_data += struct.pack(f'<I', SectorType.FREESECT) * (num_fat_sectors * fat_entries_per_sector - len(self.fat))
+        fat_data += struct.pack('<I', SectorType.FREESECT) * (num_fat_sectors * fat_entries_per_sector - len(self.fat))
 
         for i, sector_id in enumerate(fat_sector_ids):
             start = i * self.sector_size
             end = start + self.sector_size
             sector_data[sector_id] = fat_data[start:end]
 
+        # Add DIFAT sectors: 127 FAT locations followed by the next DIFAT
+        # sector id (or ENDOFCHAIN for the last one).
+        for j, sector_id in enumerate(difat_sector_ids):
+            locs = overflow_fat_locs[j * difat_entries_per_sector:(j + 1) * difat_entries_per_sector]
+            entries = list(locs)
+            entries += [SectorType.FREESECT] * (difat_entries_per_sector - len(entries))
+            if j < len(difat_sector_ids) - 1:
+                entries.append(difat_sector_ids[j + 1])
+            else:
+                entries.append(SectorType.ENDOFCHAIN)
+            sector_data[sector_id] = struct.pack(f'<{fat_entries_per_sector}I', *entries)
+
         # Write sectors in order
         for sector_id in sorted(sector_data.keys()):
             f.write(sector_data[sector_id])
 
     def _write_header(self, f: BinaryIO, dir_start_sector: int, fat_sectors: List[int],
-                      mini_fat_start: int, num_mini_fat_sectors: int):
+                      num_fat_sectors: int, mini_fat_start: int, num_mini_fat_sectors: int,
+                      difat_start: int, num_difat_sectors: int):
         """Write CFB header (512 bytes)"""
         # Signature
         f.write(self.HEADER_SIGNATURE)
@@ -332,11 +506,11 @@ class CFBWriter:
         # Reserved (6 bytes)
         f.write(b'\x00' * 6)
 
-        # Total sectors (0 for version 3)
+        # Number of directory sectors (0 for version 3)
         f.write(struct.pack('<I', 0))
 
-        # FAT sectors
-        f.write(struct.pack('<I', len(fat_sectors)))
+        # Number of FAT sectors (total, including any indexed via DIFAT sectors)
+        f.write(struct.pack('<I', num_fat_sectors))
 
         # First directory sector
         f.write(struct.pack('<I', dir_start_sector))
@@ -353,13 +527,13 @@ class CFBWriter:
         # Number of mini FAT sectors
         f.write(struct.pack('<I', num_mini_fat_sectors))
 
-        # First DIFAT sector (0xFFFFFFFE = no DIFAT)
-        f.write(struct.pack('<I', SectorType.ENDOFCHAIN))
+        # First DIFAT sector (ENDOFCHAIN when the 109 header slots suffice)
+        f.write(struct.pack('<I', difat_start))
 
         # Number of DIFAT sectors
-        f.write(struct.pack('<I', 0))
+        f.write(struct.pack('<I', num_difat_sectors))
 
-        # DIFAT array (109 entries, 4 bytes each = 436 bytes)
+        # DIFAT array: the first up to 109 FAT sector locations (436 bytes)
         for i in range(109):
             if i < len(fat_sectors):
                 f.write(struct.pack('<I', fat_sectors[i]))

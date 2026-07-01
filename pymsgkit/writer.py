@@ -162,6 +162,52 @@ class MSGWriter:
         }
         self.attachments.append(attachment)
 
+    def set_sent_time(self, dt: datetime):
+        """Set the original submit/sent time (PR_CLIENT_SUBMIT_TIME).
+
+        Essential for forensic reconstruction: without this, messages are
+        stamped with the current time rather than when they were actually sent.
+        """
+        self.set_property(PropertyTag.PR_CLIENT_SUBMIT_TIME, PropertyType.PT_SYSTIME, dt)
+
+    def set_delivery_time(self, dt: datetime):
+        """Set the delivery/received time (PR_MESSAGE_DELIVERY_TIME)."""
+        self.set_property(PropertyTag.PR_MESSAGE_DELIVERY_TIME, PropertyType.PT_SYSTIME, dt)
+
+    def set_creation_time(self, dt: datetime):
+        """Set the creation time (PR_CREATION_TIME)."""
+        self.set_property(PropertyTag.PR_CREATION_TIME, PropertyType.PT_SYSTIME, dt)
+
+    def set_modification_time(self, dt: datetime):
+        """Set the last-modification time (PR_LAST_MODIFICATION_TIME)."""
+        self.set_property(PropertyTag.PR_LAST_MODIFICATION_TIME, PropertyType.PT_SYSTIME, dt)
+
+    def set_dates(self, sent: datetime = None, received: datetime = None,
+                  created: datetime = None, modified: datetime = None):
+        """Convenience: set any combination of the message timestamps at once.
+
+        A common forensic pattern is ``msg.set_dates(sent=orig, received=orig)``
+        to stamp a reconstructed message with its original date.
+        """
+        if sent is not None:
+            self.set_sent_time(sent)
+        if received is not None:
+            self.set_delivery_time(received)
+        if created is not None:
+            self.set_creation_time(created)
+        if modified is not None:
+            self.set_modification_time(modified)
+
+    def set_message_id(self, message_id: str):
+        """Set an explicit RFC 5322 Message-ID.
+
+        When set, ``save`` will not auto-generate a random Message-ID, which
+        also makes output reproducible for a fixed set of timestamps.
+        """
+        if message_id and not (message_id.startswith('<') and message_id.endswith('>')):
+            message_id = f"<{message_id}>"
+        self.set_property(PropertyTag.PR_INTERNET_MESSAGE_ID, PropertyType.PT_STRING8, message_id)
+
     def set_conversation_index(self, parent_index: bytes = None):
         """Set conversation index for email threading"""
         if parent_index is None:
@@ -196,7 +242,14 @@ class MSGWriter:
         )
 
     def save(self, filepath: str):
-        """Save MSG file to disk"""
+        """Save MSG file to disk.
+
+        Builds the CFB container from scratch on every call so that ``save``
+        is idempotent and a single :class:`MSGWriter` can be written to more
+        than one path without duplicating streams.
+        """
+        self.cfb = CFBWriter()
+
         # Update message flags based on content
         flags = 0
         if self.attachments:
@@ -204,6 +257,9 @@ class MSGWriter:
             self.set_property(PropertyTag.PR_HASATTACH, PropertyType.PT_BOOLEAN, True)
         flags |= 0x00000001  # MSGFLAG_READ (default to read)
         self.set_property(PropertyTag.PR_MESSAGE_FLAGS, PropertyType.PT_LONG, flags)
+
+        # Synthesize an RTF body for plain-text messages (Outlook compatibility)
+        self._add_rtf_body()
 
         # Generate and add internet headers for better compatibility
         self._add_internet_headers()
@@ -228,6 +284,40 @@ class MSGWriter:
         # Write CFB to file
         self.cfb.write(filepath)
 
+    def save_eml(self, filepath: str):
+        """Export this message as an RFC 5322 ``.eml`` file.
+
+        Useful when the recipient tool imports standard internet mail rather
+        than Outlook MSG. See :mod:`pymsgkit.export`.
+        """
+        from .export import save_eml
+        save_eml(self, filepath)
+
+    def to_eml_bytes(self) -> bytes:
+        """Return this message serialized as ``.eml`` bytes."""
+        from .export import msg_to_eml_bytes
+        return msg_to_eml_bytes(self)
+
+    def _add_rtf_body(self):
+        """Add an uncompressed RTF body derived from the plain-text body.
+
+        Only done for plain-text messages: HTML messages display from PR_HTML,
+        and layering a plain RTF body on top would override the HTML. A caller
+        that has already set PR_RTF_COMPRESSED explicitly is left untouched.
+        """
+        if PropertyTag.PR_HTML in self.properties:
+            return
+        if PropertyTag.PR_RTF_COMPRESSED in self.properties:
+            return
+        if PropertyTag.PR_BODY not in self.properties:
+            return
+
+        from .properties import build_uncompressed_rtf
+        text = self.properties[PropertyTag.PR_BODY].value or ""
+        self.set_property(PropertyTag.PR_RTF_COMPRESSED, PropertyType.PT_BINARY,
+                          build_uncompressed_rtf(text))
+        self.set_property(PropertyTag.PR_RTF_IN_SYNC, PropertyType.PT_BOOLEAN, True)
+
     def _add_internet_headers(self):
         """Add internet message headers and Message-ID for compatibility"""
         # Get sender info
@@ -243,10 +333,14 @@ class MSGWriter:
         if PropertyTag.PR_SUBJECT in self.properties:
             subject = self.properties[PropertyTag.PR_SUBJECT].value
 
-        # Generate Message-ID
-        domain = sender_email.split('@')[1] if '@' in sender_email else 'pymsgkit.local'
-        message_id = generate_message_id(domain)
-        self.set_property(PropertyTag.PR_INTERNET_MESSAGE_ID, PropertyType.PT_STRING8, message_id)
+        # Message-ID: honour an explicit one set via set_message_id(); only
+        # auto-generate (random) when the caller has not provided one.
+        if PropertyTag.PR_INTERNET_MESSAGE_ID in self.properties:
+            message_id = self.properties[PropertyTag.PR_INTERNET_MESSAGE_ID].value
+        else:
+            domain = sender_email.split('@')[1] if '@' in sender_email else 'pymsgkit.local'
+            message_id = generate_message_id(domain)
+            self.set_property(PropertyTag.PR_INTERNET_MESSAGE_ID, PropertyType.PT_STRING8, message_id)
 
         # Collect recipients by type
         to_recips = [(r['email'], r['name']) for r in self.recipients if r['type'] == RecipientType.TO]
@@ -293,19 +387,24 @@ class MSGWriter:
 
     def _write_properties(self):
         """Write all message properties to CFB"""
-        # Build __properties_version1.0 stream
-        properties_data = bytearray()
-
-        # Reserved block (8 bytes of zeros)
-        properties_data.extend(b'\x00' * 8)
-
-        # Recipient and attachment counts
+        # Build __properties_version1.0 stream.
+        #
+        # Per MS-OXMSG 2.4.1.1 the *top level* properties stream has a 32-byte
+        # header, laid out as:
+        #   Reserved (8) | NextRecipientID (4) | NextAttachmentID (4) |
+        #   RecipientCount (4) | AttachmentCount (4) | Reserved (8)
+        # 16-byte property entries follow at offset 32. (Recipient/attachment
+        # sub-storages use an 8-byte reserved header instead - see below.)
         recipient_count = len(self.recipients)
         attachment_count = len(self.attachments)
-        properties_data.extend(struct.pack('<I', recipient_count))
-        properties_data.extend(struct.pack('<I', attachment_count))
-        properties_data.extend(struct.pack('<I', recipient_count))  # Next recipient ID
-        properties_data.extend(struct.pack('<I', attachment_count))  # Next attachment ID
+
+        properties_data = bytearray()
+        properties_data.extend(b'\x00' * 8)                          # Reserved
+        properties_data.extend(struct.pack('<I', recipient_count))   # Next Recipient ID
+        properties_data.extend(struct.pack('<I', attachment_count))  # Next Attachment ID
+        properties_data.extend(struct.pack('<I', recipient_count))   # Recipient Count
+        properties_data.extend(struct.pack('<I', attachment_count))  # Attachment Count
+        properties_data.extend(b'\x00' * 8)                          # Reserved (pads header to 32)
 
         # Add all property entries (fixed and variable length)
         for tag, prop in sorted(self.properties.items()):
@@ -449,24 +548,16 @@ class MSGWriter:
 
     def _write_named_properties(self):
         """
-        Write __nameid_version1.0 storage with required streams.
-        This is required by some MSG readers even if we don't use named properties.
-        Creates minimal valid structure.
+        Write the __nameid_version1.0 storage with its three required streams.
+
+        We do not emit any named properties, so the correct representation is an
+        empty mapping: all three streams present but zero-length. (Earlier
+        versions wrote a placeholder GUID and a dummy entry, which presents a
+        phantom named property that strict readers such as Outlook may reject.)
         """
-        # Create __nameid_version1.0 storage
         nameid_storage = self.cfb.add_storage("__nameid_version1.0")
 
-        # GUID stream (__substg1.0_00020102) - stores property set GUIDs (16 bytes each)
-        # Add a placeholder GUID (PS_MAPI - all zeros is valid but unused)
-        guid_stream = b'\x00' * 16  # One GUID (all zeros = PS_MAPI placeholder)
-        self.cfb.add_stream("__substg1.0_00020102", guid_stream, nameid_storage)
-
-        # Entry stream (__substg1.0_00030102) - stores named property entries
-        # Format per entry: 4 bytes (name offset/id) + 2 bytes (GUID index) + 2 bytes (property type/kind)
-        # Add one placeholder entry
-        entry_stream = struct.pack('<I', 0) + struct.pack('<H', 0) + struct.pack('<H', 0)  # 8 bytes
-        self.cfb.add_stream("__substg1.0_00030102", entry_stream, nameid_storage)
-
-        # String stream (__substg1.0_00040102) - stores string names (optional)
-        # Only needed if we have string-named properties
-        # We can skip this for now as it's optional
+        # GUID stream, entry stream, and string stream - all empty.
+        self.cfb.add_stream("__substg1.0_00020102", b"", nameid_storage)
+        self.cfb.add_stream("__substg1.0_00030102", b"", nameid_storage)
+        self.cfb.add_stream("__substg1.0_00040102", b"", nameid_storage)

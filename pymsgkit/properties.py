@@ -4,7 +4,7 @@ Based on MS-OXPROPS specification
 """
 
 import struct
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Union
 from .types import PropertyType
 
@@ -33,6 +33,7 @@ class PropertyTag:
     PR_BODY = 0x1000
     PR_HTML = 0x1013
     PR_RTF_COMPRESSED = 0x1009
+    PR_RTF_IN_SYNC = 0x0E1F
     PR_BODY_CONTENT_LOCATION = 0x1014
     PR_BODY_CONTENT_ID = 0x1015
 
@@ -156,8 +157,15 @@ class Property:
         Get the 16-byte entry for __properties_version1.0 stream.
         Format: 4 bytes property tag + 4 bytes flags + 8 bytes value/size.
         Variable-length properties store the size and reserved field.
+
+        The 32-bit MAPI property tag packs the property id in the high word and
+        the property type in the low word: ``(PropId << 16) | PropType``
+        (MS-OXCDATA 2.9). Getting this order wrong makes every fixed-length
+        property in the table unreadable to real MAPI parsers (e.g. Outlook,
+        extract-msg), even though the individual ``__substg1.0_*`` streams look
+        fine.
         """
-        prop_tag_combined = (self.prop_type << 16) | self.tag
+        prop_tag_combined = (self.tag << 16) | self.prop_type
         flags = 0  # Typically zero
 
         if self.is_fixed_length():
@@ -167,7 +175,15 @@ class Property:
             value_field = value_bytes[:8]
         else:
             encoded = self.encode_value()
-            size = len(encoded)
+            # For string properties the reported size includes the terminating
+            # null that is omitted from the stream itself (MS-OXMSG 2.4.2.2):
+            # +2 bytes for PtypString (UTF-16), +1 for PtypString8.
+            if self.prop_type == PropertyType.PT_UNICODE:
+                size = len(encoded) + 2
+            elif self.prop_type == PropertyType.PT_STRING8:
+                size = len(encoded) + 1
+            else:
+                size = len(encoded)
             value_field = struct.pack('<I', size) + struct.pack('<I', 0)
 
         return struct.pack('<I', prop_tag_combined) + struct.pack('<I', flags) + value_field
@@ -180,18 +196,21 @@ def encode_property_value(value: Any, prop_type: PropertyType) -> bytes:
     """
 
     if prop_type == PropertyType.PT_UNICODE:
-        # Unicode string: UTF-16LE with null terminator
+        # Unicode string stored as UTF-16LE. MSG string streams do NOT include
+        # the terminating null (the stream length defines the string); the
+        # reported property size in the table counts it (see Property.get_entry).
         if isinstance(value, str):
-            return value.encode('utf-16le') + b'\x00\x00'
-        return b'\x00\x00'
+            return value.encode('utf-16le')
+        return b''
 
     elif prop_type == PropertyType.PT_STRING8:
-        # ASCII string with null terminator
+        # 8-bit string, no terminating null in the stream. Fall back gracefully
+        # on characters outside the code page instead of raising (e.g. CJK).
         if isinstance(value, str):
-            return value.encode('cp1252') + b'\x00'
+            return value.encode('cp1252', errors='replace')
         elif isinstance(value, bytes):
-            return value + b'\x00'
-        return b'\x00'
+            return value
+        return b''
 
     elif prop_type == PropertyType.PT_BINARY:
         # Binary data - pass through as-is
@@ -287,26 +306,88 @@ def filetime_to_datetime(filetime: int) -> datetime:
     epoch = datetime(1601, 1, 1, tzinfo=timezone.utc)
     # Convert 100-nanosecond intervals to seconds
     seconds = filetime / 10000000
-    return epoch + timezone.timedelta(seconds=seconds)
+    return epoch + timedelta(seconds=seconds)
+
+
+# Provider UID for a One-Off EntryID (MS-OXCDATA 2.2.5.1):
+# {A41F2B81-A3BE-1019-9D6E-00DD010F5402}
+_ONE_OFF_PROVIDER_UID = bytes.fromhex('812B1FA4BEA310199D6E00DD010F5402')
+
+# Bit flags (2 bytes) for the one-off: MAPI_ONE_OFF_UNICODE (0x8000) means the
+# strings are UTF-16LE; MAPI_ONE_OFF_NO_RICH_INFO (0x0001) means plain text.
+_ONE_OFF_UNICODE = 0x8000
+_ONE_OFF_NO_RICH_INFO = 0x0001
 
 
 def create_entryid(email: str, display_name: str, addr_type: str = "SMTP") -> bytes:
     """
-    Create a simple EntryID for email address.
-    This is a simplified version - full implementation would follow MS-OXCDATA spec.
-    """
-    # Simplified one-off EntryID structure
-    # In practice, this should follow the full specification
-    flags = 0x00000000
-    provider_uid = b'\x00' * 16  # Simplified
-    version = 0
-    addr_type_bytes = (addr_type + '\x00').encode('ascii')
-    email_bytes = (email + '\x00').encode('ascii')
-    display_bytes = (display_name + '\x00').encode('ascii')
+    Create a One-Off EntryID for an email address per MS-OXCDATA 2.2.5.1.
 
-    return (struct.pack('<I', flags) + provider_uid +
-            struct.pack('<I', version) +
-            addr_type_bytes + email_bytes + display_bytes)
+    Layout: Flags(4) + ProviderUID(16) + Version(2) + BitFlags(2) +
+    DisplayName + AddressType + EmailAddress, each string UTF-16LE and
+    null-terminated (Unicode flag set).
+    """
+    flags = 0x00000000
+    version = 0x0000
+    bit_flags = _ONE_OFF_UNICODE | _ONE_OFF_NO_RICH_INFO
+
+    def u(s):
+        return (s or "").encode('utf-16le') + b'\x00\x00'
+
+    return (struct.pack('<I', flags) + _ONE_OFF_PROVIDER_UID +
+            struct.pack('<H', version) + struct.pack('<H', bit_flags) +
+            u(display_name) + u(addr_type) + u(email))
+
+
+def _rtf_escape(text: str) -> str:
+    """Escape plain text for inclusion in an RTF document body."""
+    out = []
+    for ch in text:
+        if ch == '\\':
+            out.append('\\\\')
+        elif ch == '{':
+            out.append('\\{')
+        elif ch == '}':
+            out.append('\\}')
+        elif ch == '\n':
+            out.append('\\par\n')
+        elif ch == '\r':
+            continue
+        elif ch == '\t':
+            out.append('\\tab ')
+        elif ord(ch) < 128:
+            out.append(ch)
+        else:
+            # \uN control word with a signed 16-bit value and a '?' ANSI fallback.
+            code = ord(ch)
+            if code > 0xFFFF:
+                code -= 0x10000
+                hi = 0xD800 + (code >> 10)
+                lo = 0xDC00 + (code & 0x3FF)
+                for unit in (hi, lo):
+                    out.append(f"\\u{unit if unit < 0x8000 else unit - 0x10000}?")
+            else:
+                out.append(f"\\u{code if code < 0x8000 else code - 0x10000}?")
+    return ''.join(out)
+
+
+def build_uncompressed_rtf(text: str) -> bytes:
+    """Build a PR_RTF_COMPRESSED stream holding *uncompressed* RTF.
+
+    MS-OXRTFCP allows an uncompressed payload identified by the 'MELA'
+    (0x414C454D) marker, which avoids implementing the LZ compressor while
+    still producing a valid RTF body that Outlook renders.
+    """
+    rtf = ("{\\rtf1\\ansi\\ansicpg1252\\fromtext\\deff0"
+           "{\\fonttbl{\\f0\\fswiss\\fcharset0 Arial;}}"
+           "\\pard\\plain\\f0\\fs20 " + _rtf_escape(text) + "\\par}")
+    rtf_bytes = rtf.encode('ascii', errors='replace')  # non-ASCII already \u-escaped
+
+    COMPTYPE_UNCOMPRESSED = 0x414C454D  # 'MELA'
+    raw_size = len(rtf_bytes)
+    comp_size = raw_size + 12  # number of bytes following the compSize field
+    header = struct.pack('<IIII', comp_size, raw_size, COMPTYPE_UNCOMPRESSED, 0)
+    return header + rtf_bytes
 
 
 def create_search_key(addr_type: str, email: str) -> bytes:
@@ -315,7 +396,7 @@ def create_search_key(addr_type: str, email: str) -> bytes:
     Format: ADDRTYPE:EMAIL in uppercase
     """
     search_key_str = f"{addr_type}:{email}".upper()
-    return search_key_str.encode('ascii') + b'\x00'
+    return search_key_str.encode('utf-8', errors='replace') + b'\x00'
 
 
 def generate_message_id(domain: str = "pymsgkit.local") -> str:

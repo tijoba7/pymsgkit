@@ -5,10 +5,14 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="pymsgkit",
-    version="1.0.0",
+    version="1.3.0",
     author="PyMsgKit Contributors",
     author_email="your.email@example.com",
-    description="Pure Python library for creating Outlook MSG files",
+    description="Pure Python library for creating Outlook MSG files (plus EML/MBOX export)",
+    extras_require={
+        "test": ["pytest>=7", "olefile>=0.46"],
+        "validate": ["extract-msg"],
+    },
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/yourusername/pymsgkit",

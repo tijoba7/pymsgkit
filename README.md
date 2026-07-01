@@ -14,6 +14,7 @@ Pure Python library for creating Microsoft Outlook MSG files without requiring O
 - ✅ **HTML & Plain Text** - Full support for both body formats
 - ✅ **Pure Python** - No external dependencies, works on Linux/Mac/Windows
 - ✅ **Full MAPI property support** - Complete control over message properties
+- ✅ **EML & MBOX export** - Emit standard RFC 5322 `.eml` files and collect many messages into a single portable `.mbox` archive
 
 ## Installation
 
@@ -138,6 +139,48 @@ with open("logo.png", "rb") as f:
 msg.save("newsletter.msg")
 ```
 
+### Export to EML and MBOX
+
+Besides Outlook `.msg`, PyMsgKit can emit standard internet-mail formats. A
+single message becomes an RFC 5322 `.eml`, and many messages can be collected
+into one `.mbox` archive that Outlook, Thunderbird, Apple Mail, and eDiscovery
+tools import directly:
+
+```python
+from pymsgkit import MSGWriter, MboxWriter
+
+msg = MSGWriter()
+msg.set_subject("Welcome")
+msg.set_sender("welcome@company.com", "Welcome Team")
+msg.add_recipient("newuser@example.com", "New User")
+msg.set_body("Thanks for joining!")
+
+# Single message -> .eml
+msg.save_eml("welcome.eml")
+# ...and still available as .msg
+msg.save("welcome.msg")
+
+# Many messages -> one .mbox archive
+box = MboxWriter()
+box.add(msg)
+box.add(another_msg)
+box.save("archive.mbox")
+```
+
+### What about `.pst`?
+
+A `.pst` file is **not** "a bunch of MSG files in a container" — it is a full
+on-disk database (the MS-PST NDB/LTP layers: CRC-protected pages, node/block
+B-trees, heap-on-node, table and property contexts, encoded blocks, a folder
+hierarchy, and a named-property map). Writing one correctly from scratch is an
+order of magnitude more work than this entire MSG library, which is why no
+pure-Python PST *writer* exists in the wild.
+
+For the real need behind "make a PST" — **collecting many messages into one
+importable archive** — use the MBOX/EML export above. Outlook and every major
+mail client can import MBOX, so it covers the practical use case without the
+MS-PST complexity. Native PST authoring is intentionally out of scope.
+
 ## Use Cases
 
 ### eDiscovery & Forensics
@@ -155,6 +198,72 @@ msg.save("evidence_email.msg")
 ```
 
 Standard Outlook APIs won't let you set arbitrary senders, but MSG files created with PyMsgKit bypass this restriction by writing directly to the file structure.
+
+#### Setting original timestamps
+
+When reconstructing historical evidence, stamp the message with its **original**
+dates rather than "now" (the default). All four MAPI timestamps can be set:
+
+```python
+from datetime import datetime, timezone
+
+msg = MSGWriter()
+msg.set_subject("Reconstructed Email")
+msg.set_sender("original.sender@company.com", "Original Sender")
+msg.add_recipient("legal@company.com", "Legal Team")
+msg.set_body("Reconstructed from archive data.")
+
+orig = datetime(2019, 3, 14, 9, 26, 53, tzinfo=timezone.utc)
+msg.set_dates(sent=orig, received=orig, created=orig, modified=orig)
+msg.save("evidence_email.msg")
+```
+
+#### Reproducible output
+
+For chain-of-custody and hash verification you often want the same input to
+produce **byte-identical** files. Output is deterministic once you pin the
+timestamps (above) and the Message-ID:
+
+```python
+msg.set_message_id("case-2024-001@evidence.local")
+```
+
+Without these, PyMsgKit stamps the current time and a random Message-ID /
+conversation GUID, so files differ run to run.
+
+#### Compatibility & validation
+
+Output is validated against multiple independent checks:
+
+- **olefile** — confirms a well-formed Compound File Binary container
+- **extract-msg** (the de-facto forensic MSG library) — opens the files in its
+  **strict** default mode and reads back subject, sender, recipients (with
+  correct To/Cc/Bcc types), body, RTF body, attachments, and timestamps
+- **MS-CFB red-black tree invariants** — the directory tree is verified to be
+  BST-ordered and red-black-valid, which is exactly what the Windows
+  Structured Storage implementation (and therefore Outlook/MAPI) requires
+
+For Windows/Outlook compatibility specifically, PyMsgKit:
+
+- builds the CFB directory as a proper **red-black tree** (Windows rejects the
+  degenerate sibling chains that lenient parsers tolerate);
+- fills unused directory slots with valid EMPTY entries (not `0xFF` filler);
+- writes full **MS-OXCDATA one-off EntryIDs** for sender/recipients;
+- emits an uncompressed **`PR_RTF_COMPRESSED`** body for plain-text messages;
+- represents "no named properties" as three empty `__nameid` streams rather
+  than a phantom placeholder entry.
+
+Large messages are supported: attachments beyond the ~7 MB single-FAT limit are
+written using a DIFAT chain (tested to 50 MB), so big evidence files don't
+silently corrupt.
+
+**Please still verify against your own target Outlook build before relying on
+output in a matter.** CI has no Windows image, so the Windows guarantees above
+come from conformance tests against the MS-CFB/MS-OXMSG specifications and the
+extract-msg parser, not from launching Outlook itself. Remaining notes:
+
+- HTML messages display from `PR_HTML`; a plain RTF body is not layered on top
+  of HTML (doing so would override it). Encapsulated HTML-in-RTF is not generated.
 
 ### Automated Email Generation
 
@@ -190,12 +299,26 @@ Main class for creating MSG files.
 - `add_recipient(email: str, name: str = "", recipient_type: RecipientType = RecipientType.TO)` - Add recipient
 - `add_attachment(filename: str, data: bytes, content_id: str = None, mime_type: str = None, is_inline: bool = False)` - Add attachment
 - `set_conversation_index(parent_index: bytes = None)` - Set threading
+- `set_sent_time(dt)` / `set_delivery_time(dt)` / `set_creation_time(dt)` / `set_modification_time(dt)` - Set individual MAPI timestamps
+- `set_dates(sent=None, received=None, created=None, modified=None)` - Set several timestamps at once (forensic reconstruction)
+- `set_message_id(message_id: str)` - Set an explicit Message-ID (also makes output reproducible)
 - `set_property(prop_tag: int, prop_type: int, value: Any)` - Set custom MAPI property
 - `save(filepath: str)` - Save to MSG file
+- `save_eml(filepath: str)` - Export the message as an RFC 5322 `.eml` file
+- `to_eml_bytes() -> bytes` - Return the message serialized as `.eml` bytes
+
+### MboxWriter
+
+Collect multiple messages into a single `.mbox` archive.
+
+- `add(msg)` - Add an `MSGWriter` (or a pre-built `email.message.EmailMessage`)
+- `save(filepath: str)` - Write all collected messages to an mbox file
+- `len(box)` - Number of messages currently collected
 
 ### Helper Functions
 
 - `create_email(...)` - Quick email creation with sensible defaults
+- `save_eml(msg, filepath)` / `msg_to_eml_bytes(msg)` / `msg_to_email_message(msg)` - EML export helpers
 
 ### Enums
 
@@ -225,13 +348,29 @@ The library creates valid MSG files by:
 
 ## Testing
 
+Install the test extras (pytest + olefile), then run the suite. The tests read
+generated files back with the independent `olefile` parser and assert the
+decoded MAPI properties match the input, so they validate real output rather
+than just that a file was written.
+
 ```bash
-# Run tests
+# Install test dependencies
+pip install -e ".[test]"
+
+# Run all tests
 python -m pytest tests/
 
-# Run specific test
-python -m pytest tests/test_basic.py -v
+# Run a specific module
+python -m pytest tests/test_roundtrip.py -v
 ```
+
+Test modules:
+
+- `test_basic.py` - smoke tests and CFB signature checks
+- `test_roundtrip.py` - write then read back with olefile; verify subject, body, sender, recipients, attachments, flags, timestamps
+- `test_cfb.py` - Compound File Binary structure (mini + regular sectors, nested storages, many siblings, large streams)
+- `test_properties.py` - MAPI property encoders (strings, ints, booleans, FILETIME, entryid, search key, headers)
+- `test_export.py` - EML and MBOX export
 
 ## Contributing
 
@@ -258,6 +397,32 @@ MIT License - see LICENSE file for details
 - **Discussions**: [GitHub Discussions](https://github.com/yourusername/pymsgkit/discussions)
 
 ## Changelog
+
+### v1.3.0 (2026-07-01)
+- **Windows / Outlook compatibility**: build the CFB directory as a proper red-black tree (sorted by the MS-CFB name comparison). Windows Structured Storage rejects the degenerate sibling chains that olefile/extract-msg tolerate — this was the main reason files failed to open in Outlook on Windows.
+- Fill unused directory slots with valid EMPTY entries instead of `0xFF` filler (which Windows reads as invalid entries).
+- Write full **MS-OXCDATA one-off EntryIDs** (correct provider GUID + Unicode strings) for sender and recipients, replacing the previous simplified stub.
+- Generate an uncompressed **`PR_RTF_COMPRESSED`** body (MS-OXRTFCP 'MELA') for plain-text messages, with `PR_RTF_IN_SYNC`.
+- Represent "no named properties" as three empty `__nameid_version1.0` streams instead of a phantom placeholder entry.
+- Added 19 tests: MS-CFB red-black tree invariant validation (up to 128 siblings + real messages) and RTF body checks; suite now at 83 tests.
+
+### v1.2.0 (2026-07-01)
+- **MSG spec-compliance fixes** (files now open in extract-msg's strict mode and other real MAPI parsers):
+  - Corrected the property-tag byte order in the property table (`(PropId << 16) | PropType`); previously every fixed-length property (recipient type, message flags, timestamps, importance) was unreadable to MAPI parsers even though string streams looked fine.
+  - Fixed the top-level `__properties_version1.0` header size (32 bytes per MS-OXMSG 2.4.1.1); property entries were 8 bytes out of phase.
+  - String streams no longer embed the terminating null (it's counted in the table size instead), eliminating trailing `\x00` in parsed values.
+- **Large files**: implemented the CFB DIFAT chain so attachments beyond ~7 MB no longer silently corrupt (tested to 50 MB).
+- **Forensic metadata API**: `set_sent_time` / `set_delivery_time` / `set_creation_time` / `set_modification_time` / `set_dates` to stamp original timestamps, and `set_message_id` for explicit, reproducible Message-IDs.
+- **Validation**: added a test layer that opens output with extract-msg (strict mode) so spec regressions are caught; suite now at 64 tests.
+
+### v1.1.0 (2026-07-01)
+- Added EML export (`save_eml`, `to_eml_bytes`, `msg_to_email_message`)
+- Added `MboxWriter` for collecting many messages into one `.mbox` archive
+- Documented why native `.pst` writing is out of scope and MBOX/EML is the practical alternative
+- Made `MSGWriter.save()` idempotent (a single writer can be saved to multiple paths without duplicating streams)
+- Fixed `filetime_to_datetime` (used a non-existent `timezone.timedelta`)
+- Hardened string encoding so non-ASCII senders/recipients/subjects no longer raise
+- Rebuilt the test suite around independent olefile round-trip validation (52 tests)
 
 ### v1.0.0 (2025-01-XX)
 - Initial release
