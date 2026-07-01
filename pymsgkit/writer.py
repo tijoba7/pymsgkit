@@ -196,7 +196,14 @@ class MSGWriter:
         )
 
     def save(self, filepath: str):
-        """Save MSG file to disk"""
+        """Save MSG file to disk.
+
+        Builds the CFB container from scratch on every call so that ``save``
+        is idempotent and a single :class:`MSGWriter` can be written to more
+        than one path without duplicating streams.
+        """
+        self.cfb = CFBWriter()
+
         # Update message flags based on content
         flags = 0
         if self.attachments:
@@ -227,6 +234,20 @@ class MSGWriter:
 
         # Write CFB to file
         self.cfb.write(filepath)
+
+    def save_eml(self, filepath: str):
+        """Export this message as an RFC 5322 ``.eml`` file.
+
+        Useful when the recipient tool imports standard internet mail rather
+        than Outlook MSG. See :mod:`pymsgkit.export`.
+        """
+        from .export import save_eml
+        save_eml(self, filepath)
+
+    def to_eml_bytes(self) -> bytes:
+        """Return this message serialized as ``.eml`` bytes."""
+        from .export import msg_to_eml_bytes
+        return msg_to_eml_bytes(self)
 
     def _add_internet_headers(self):
         """Add internet message headers and Message-ID for compatibility"""

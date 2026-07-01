@@ -5,6 +5,8 @@ PyMsgKit - Pure Python library for creating Outlook MSG files
 from .writer import MSGWriter
 from .types import RecipientType, PropertyType, AttachMethod
 from .properties import PropertyTag
+from .export import (MboxWriter, save_eml, msg_to_eml_bytes,
+                     msg_to_email_message)
 
 def create_email(subject, body, sender_email, sender_name="",
                  to_recipients=None, cc_recipients=None, bcc_recipients=None,
@@ -44,5 +46,9 @@ def create_email(subject, body, sender_email, sender_name="",
 
     return msg
 
-__version__ = "1.0.0"
-__all__ = ['MSGWriter', 'create_email', 'RecipientType', 'PropertyType', 'AttachMethod', 'PropertyTag']
+__version__ = "1.1.0"
+__all__ = [
+    'MSGWriter', 'create_email',
+    'RecipientType', 'PropertyType', 'AttachMethod', 'PropertyTag',
+    'MboxWriter', 'save_eml', 'msg_to_eml_bytes', 'msg_to_email_message',
+]

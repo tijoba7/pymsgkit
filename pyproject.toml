@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pymsgkit"
-version = "1.0.0"
-description = "Pure Python library for creating Outlook MSG files"
+version = "1.1.0"
+description = "Pure Python library for creating Outlook MSG files (plus EML/MBOX export)"
 readme = "README.md"
 requires-python = ">=3.7"
 license = {text = "MIT"}
-keywords = ["msg", "outlook", "email", "mapi", "ediscovery", "forensics"]
+keywords = ["msg", "outlook", "email", "mapi", "ediscovery", "forensics", "eml", "mbox"]
 authors = [
   {name = "PyMsgKit Contributors"}
 ]
@@ -20,8 +20,16 @@ classifiers = [
   "Programming Language :: Python :: 3",
 ]
 
+[project.optional-dependencies]
+# Only needed to run the test suite; the library itself is dependency-free.
+test = ["pytest>=7", "olefile>=0.46"]
+
 [project.urls]
 Homepage = "https://github.com/yourusername/pymsgkit"
 Documentation = "https://github.com/yourusername/pymsgkit#readme"
 Repository = "https://github.com/yourusername/pymsgkit"
 Issues = "https://github.com/yourusername/pymsgkit/issues"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

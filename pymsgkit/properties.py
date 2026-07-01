@@ -4,7 +4,7 @@ Based on MS-OXPROPS specification
 """
 
 import struct
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Union
 from .types import PropertyType
 
@@ -186,9 +186,10 @@ def encode_property_value(value: Any, prop_type: PropertyType) -> bytes:
         return b'\x00\x00'
 
     elif prop_type == PropertyType.PT_STRING8:
-        # ASCII string with null terminator
+        # 8-bit string with null terminator. Fall back gracefully on characters
+        # outside the target code page instead of raising (e.g. CJK in a subject).
         if isinstance(value, str):
-            return value.encode('cp1252') + b'\x00'
+            return value.encode('cp1252', errors='replace') + b'\x00'
         elif isinstance(value, bytes):
             return value + b'\x00'
         return b'\x00'
@@ -287,7 +288,7 @@ def filetime_to_datetime(filetime: int) -> datetime:
     epoch = datetime(1601, 1, 1, tzinfo=timezone.utc)
     # Convert 100-nanosecond intervals to seconds
     seconds = filetime / 10000000
-    return epoch + timezone.timedelta(seconds=seconds)
+    return epoch + timedelta(seconds=seconds)
 
 
 def create_entryid(email: str, display_name: str, addr_type: str = "SMTP") -> bytes:
@@ -300,9 +301,11 @@ def create_entryid(email: str, display_name: str, addr_type: str = "SMTP") -> by
     flags = 0x00000000
     provider_uid = b'\x00' * 16  # Simplified
     version = 0
-    addr_type_bytes = (addr_type + '\x00').encode('ascii')
-    email_bytes = (email + '\x00').encode('ascii')
-    display_bytes = (display_name + '\x00').encode('ascii')
+    # Use UTF-8 with a safe fallback so non-ASCII names/addresses don't crash
+    # (common in eDiscovery / international mail).
+    addr_type_bytes = (addr_type + '\x00').encode('utf-8', errors='replace')
+    email_bytes = (email + '\x00').encode('utf-8', errors='replace')
+    display_bytes = (display_name + '\x00').encode('utf-8', errors='replace')
 
     return (struct.pack('<I', flags) + provider_uid +
             struct.pack('<I', version) +
@@ -315,7 +318,7 @@ def create_search_key(addr_type: str, email: str) -> bytes:
     Format: ADDRTYPE:EMAIL in uppercase
     """
     search_key_str = f"{addr_type}:{email}".upper()
-    return search_key_str.encode('ascii') + b'\x00'
+    return search_key_str.encode('utf-8', errors='replace') + b'\x00'
 
 
 def generate_message_id(domain: str = "pymsgkit.local") -> str:
