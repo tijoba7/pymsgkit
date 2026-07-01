@@ -102,6 +102,29 @@ def test_stream_spanning_multiple_regular_sectors(tmp_path):
         ole.close()
 
 
+def test_difat_large_file(tmp_path):
+    """A stream past the 109-FAT-sector (~7 MB) limit needs DIFAT sectors.
+
+    Before DIFAT support this produced a silently corrupt, unreadable file.
+    """
+    path = tmp_path / "difat.cfb"
+    cfb = CFBWriter()
+    data = bytes((i * 13) % 256 for i in range(9 * 1024 * 1024))  # 9 MB
+    cfb.add_stream("blob", data)
+    cfb.write(str(path))
+
+    assert olefile.isOleFile(str(path))
+    ole = olefile.OleFileIO(str(path))
+    try:
+        assert ole.openstream("blob").read() == data
+    finally:
+        ole.close()
+
+    # Header must advertise a DIFAT chain (num DIFAT sectors > 0 at offset 72).
+    raw = path.read_bytes()
+    assert struct.unpack("<I", raw[72:76])[0] >= 1
+
+
 def test_header_fields(tmp_path):
     path = tmp_path / "h.cfb"
     cfb = CFBWriter()

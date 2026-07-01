@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pymsgkit"
-version = "1.1.0"
+version = "1.2.0"
 description = "Pure Python library for creating Outlook MSG files (plus EML/MBOX export)"
 readme = "README.md"
 requires-python = ">=3.7"
@@ -23,6 +23,9 @@ classifiers = [
 [project.optional-dependencies]
 # Only needed to run the test suite; the library itself is dependency-free.
 test = ["pytest>=7", "olefile>=0.46"]
+# Optional: validate output against the forensic-standard MSG parser. The
+# forensic-validation tests are skipped automatically if this is not installed.
+validate = ["extract-msg"]
 
 [project.urls]
 Homepage = "https://github.com/yourusername/pymsgkit"

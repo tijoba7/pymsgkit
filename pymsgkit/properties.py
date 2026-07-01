@@ -156,8 +156,15 @@ class Property:
         Get the 16-byte entry for __properties_version1.0 stream.
         Format: 4 bytes property tag + 4 bytes flags + 8 bytes value/size.
         Variable-length properties store the size and reserved field.
+
+        The 32-bit MAPI property tag packs the property id in the high word and
+        the property type in the low word: ``(PropId << 16) | PropType``
+        (MS-OXCDATA 2.9). Getting this order wrong makes every fixed-length
+        property in the table unreadable to real MAPI parsers (e.g. Outlook,
+        extract-msg), even though the individual ``__substg1.0_*`` streams look
+        fine.
         """
-        prop_tag_combined = (self.prop_type << 16) | self.tag
+        prop_tag_combined = (self.tag << 16) | self.prop_type
         flags = 0  # Typically zero
 
         if self.is_fixed_length():
@@ -167,7 +174,15 @@ class Property:
             value_field = value_bytes[:8]
         else:
             encoded = self.encode_value()
-            size = len(encoded)
+            # For string properties the reported size includes the terminating
+            # null that is omitted from the stream itself (MS-OXMSG 2.4.2.2):
+            # +2 bytes for PtypString (UTF-16), +1 for PtypString8.
+            if self.prop_type == PropertyType.PT_UNICODE:
+                size = len(encoded) + 2
+            elif self.prop_type == PropertyType.PT_STRING8:
+                size = len(encoded) + 1
+            else:
+                size = len(encoded)
             value_field = struct.pack('<I', size) + struct.pack('<I', 0)
 
         return struct.pack('<I', prop_tag_combined) + struct.pack('<I', flags) + value_field
@@ -180,19 +195,21 @@ def encode_property_value(value: Any, prop_type: PropertyType) -> bytes:
     """
 
     if prop_type == PropertyType.PT_UNICODE:
-        # Unicode string: UTF-16LE with null terminator
+        # Unicode string stored as UTF-16LE. MSG string streams do NOT include
+        # the terminating null (the stream length defines the string); the
+        # reported property size in the table counts it (see Property.get_entry).
         if isinstance(value, str):
-            return value.encode('utf-16le') + b'\x00\x00'
-        return b'\x00\x00'
+            return value.encode('utf-16le')
+        return b''
 
     elif prop_type == PropertyType.PT_STRING8:
-        # 8-bit string with null terminator. Fall back gracefully on characters
-        # outside the target code page instead of raising (e.g. CJK in a subject).
+        # 8-bit string, no terminating null in the stream. Fall back gracefully
+        # on characters outside the code page instead of raising (e.g. CJK).
         if isinstance(value, str):
-            return value.encode('cp1252', errors='replace') + b'\x00'
+            return value.encode('cp1252', errors='replace')
         elif isinstance(value, bytes):
-            return value + b'\x00'
-        return b'\x00'
+            return value
+        return b''
 
     elif prop_type == PropertyType.PT_BINARY:
         # Binary data - pass through as-is

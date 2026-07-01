@@ -46,7 +46,7 @@ def create_email(subject, body, sender_email, sender_name="",
 
     return msg
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __all__ = [
     'MSGWriter', 'create_email',
     'RecipientType', 'PropertyType', 'AttachMethod', 'PropertyTag',

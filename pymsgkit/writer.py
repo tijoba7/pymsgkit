@@ -162,6 +162,52 @@ class MSGWriter:
         }
         self.attachments.append(attachment)
 
+    def set_sent_time(self, dt: datetime):
+        """Set the original submit/sent time (PR_CLIENT_SUBMIT_TIME).
+
+        Essential for forensic reconstruction: without this, messages are
+        stamped with the current time rather than when they were actually sent.
+        """
+        self.set_property(PropertyTag.PR_CLIENT_SUBMIT_TIME, PropertyType.PT_SYSTIME, dt)
+
+    def set_delivery_time(self, dt: datetime):
+        """Set the delivery/received time (PR_MESSAGE_DELIVERY_TIME)."""
+        self.set_property(PropertyTag.PR_MESSAGE_DELIVERY_TIME, PropertyType.PT_SYSTIME, dt)
+
+    def set_creation_time(self, dt: datetime):
+        """Set the creation time (PR_CREATION_TIME)."""
+        self.set_property(PropertyTag.PR_CREATION_TIME, PropertyType.PT_SYSTIME, dt)
+
+    def set_modification_time(self, dt: datetime):
+        """Set the last-modification time (PR_LAST_MODIFICATION_TIME)."""
+        self.set_property(PropertyTag.PR_LAST_MODIFICATION_TIME, PropertyType.PT_SYSTIME, dt)
+
+    def set_dates(self, sent: datetime = None, received: datetime = None,
+                  created: datetime = None, modified: datetime = None):
+        """Convenience: set any combination of the message timestamps at once.
+
+        A common forensic pattern is ``msg.set_dates(sent=orig, received=orig)``
+        to stamp a reconstructed message with its original date.
+        """
+        if sent is not None:
+            self.set_sent_time(sent)
+        if received is not None:
+            self.set_delivery_time(received)
+        if created is not None:
+            self.set_creation_time(created)
+        if modified is not None:
+            self.set_modification_time(modified)
+
+    def set_message_id(self, message_id: str):
+        """Set an explicit RFC 5322 Message-ID.
+
+        When set, ``save`` will not auto-generate a random Message-ID, which
+        also makes output reproducible for a fixed set of timestamps.
+        """
+        if message_id and not (message_id.startswith('<') and message_id.endswith('>')):
+            message_id = f"<{message_id}>"
+        self.set_property(PropertyTag.PR_INTERNET_MESSAGE_ID, PropertyType.PT_STRING8, message_id)
+
     def set_conversation_index(self, parent_index: bytes = None):
         """Set conversation index for email threading"""
         if parent_index is None:
@@ -264,10 +310,14 @@ class MSGWriter:
         if PropertyTag.PR_SUBJECT in self.properties:
             subject = self.properties[PropertyTag.PR_SUBJECT].value
 
-        # Generate Message-ID
-        domain = sender_email.split('@')[1] if '@' in sender_email else 'pymsgkit.local'
-        message_id = generate_message_id(domain)
-        self.set_property(PropertyTag.PR_INTERNET_MESSAGE_ID, PropertyType.PT_STRING8, message_id)
+        # Message-ID: honour an explicit one set via set_message_id(); only
+        # auto-generate (random) when the caller has not provided one.
+        if PropertyTag.PR_INTERNET_MESSAGE_ID in self.properties:
+            message_id = self.properties[PropertyTag.PR_INTERNET_MESSAGE_ID].value
+        else:
+            domain = sender_email.split('@')[1] if '@' in sender_email else 'pymsgkit.local'
+            message_id = generate_message_id(domain)
+            self.set_property(PropertyTag.PR_INTERNET_MESSAGE_ID, PropertyType.PT_STRING8, message_id)
 
         # Collect recipients by type
         to_recips = [(r['email'], r['name']) for r in self.recipients if r['type'] == RecipientType.TO]
@@ -314,19 +364,24 @@ class MSGWriter:
 
     def _write_properties(self):
         """Write all message properties to CFB"""
-        # Build __properties_version1.0 stream
-        properties_data = bytearray()
-
-        # Reserved block (8 bytes of zeros)
-        properties_data.extend(b'\x00' * 8)
-
-        # Recipient and attachment counts
+        # Build __properties_version1.0 stream.
+        #
+        # Per MS-OXMSG 2.4.1.1 the *top level* properties stream has a 32-byte
+        # header, laid out as:
+        #   Reserved (8) | NextRecipientID (4) | NextAttachmentID (4) |
+        #   RecipientCount (4) | AttachmentCount (4) | Reserved (8)
+        # 16-byte property entries follow at offset 32. (Recipient/attachment
+        # sub-storages use an 8-byte reserved header instead - see below.)
         recipient_count = len(self.recipients)
         attachment_count = len(self.attachments)
-        properties_data.extend(struct.pack('<I', recipient_count))
-        properties_data.extend(struct.pack('<I', attachment_count))
-        properties_data.extend(struct.pack('<I', recipient_count))  # Next recipient ID
-        properties_data.extend(struct.pack('<I', attachment_count))  # Next attachment ID
+
+        properties_data = bytearray()
+        properties_data.extend(b'\x00' * 8)                          # Reserved
+        properties_data.extend(struct.pack('<I', recipient_count))   # Next Recipient ID
+        properties_data.extend(struct.pack('<I', attachment_count))  # Next Attachment ID
+        properties_data.extend(struct.pack('<I', recipient_count))   # Recipient Count
+        properties_data.extend(struct.pack('<I', attachment_count))  # Attachment Count
+        properties_data.extend(b'\x00' * 8)                          # Reserved (pads header to 32)
 
         # Add all property entries (fixed and variable length)
         for tag, prop in sorted(self.properties.items()):

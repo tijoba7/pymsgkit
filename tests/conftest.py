@@ -89,15 +89,16 @@ class MsgReader:
         if not self.ole.exists(path):
             return {}
         data = self.ole.openstream(path).read()
-        # Top-level header is 8 (reserved) + 16 (counts) = 24 bytes; sub
-        # storages use an 8-byte reserved header only.
-        header = 24 if storage == "" else 8
+        # Top-level header is 32 bytes (MS-OXMSG 2.4.1.1); recipient/attachment
+        # sub storages use an 8-byte reserved header only.
+        header = 32 if storage == "" else 8
         props = {}
         body = data[header:]
         for i in range(0, len(body) - 15, 16):
             entry = body[i:i + 16]
             combined = struct.unpack("<I", entry[0:4])[0]
-            tag = combined & 0xFFFF
+            # MAPI tag packs PropId in the high word, PropType in the low word.
+            tag = (combined >> 16) & 0xFFFF
             props[tag] = entry[8:16]
         return props
 

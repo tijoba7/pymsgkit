@@ -262,20 +262,51 @@ class CFBWriter:
                 num_mini_fat_sectors = len(mini_fat_sectors)
                 stream_sectors[-3] = (mini_fat_data, mini_fat_sectors)
 
-        # Allocate sectors for FAT
-        # FAT includes entries for itself, so we need to calculate iteratively
-        fat_entries_per_sector = self.sector_size // 4
-        num_fat_sectors = (len(self.fat) + fat_entries_per_sector - 1) // fat_entries_per_sector
+        # Allocate sectors for the FAT (and DIFAT, if the file is large enough
+        # to need more than 109 FAT sectors). Every FAT and DIFAT sector is
+        # itself a sector the FAT must describe, so the counts are interdependent
+        # and solved with a small fixpoint loop.
+        fat_entries_per_sector = self.sector_size // 4          # 128 for 512-byte sectors
+        difat_entries_per_sector = fat_entries_per_sector - 1   # 127; last slot chains
+        HEADER_DIFAT_SLOTS = 109
 
-        # Add FAT sector entries to FAT
-        fat_sector_ids = []
-        for i in range(num_fat_sectors):
-            fat_sector_id = len(self.fat)
-            fat_sector_ids.append(fat_sector_id)
-            self.fat.append(SectorType.FATSECT)
+        content_sectors = len(self.fat)  # data / directory / mini-FAT sectors
+
+        num_fat_sectors = 0
+        num_difat_sectors = 0
+        while True:
+            total = content_sectors + num_fat_sectors + num_difat_sectors
+            new_fat = (total + fat_entries_per_sector - 1) // fat_entries_per_sector
+            overflow = max(0, new_fat - HEADER_DIFAT_SLOTS)
+            new_difat = (overflow + difat_entries_per_sector - 1) // difat_entries_per_sector
+            if new_fat == num_fat_sectors and new_difat == num_difat_sectors:
+                break
+            num_fat_sectors, num_difat_sectors = new_fat, new_difat
+
+        # Sector ids: FAT sectors first, then DIFAT sectors.
+        fat_sector_ids = list(range(content_sectors, content_sectors + num_fat_sectors))
+        difat_sector_ids = list(range(content_sectors + num_fat_sectors,
+                                      content_sectors + num_fat_sectors + num_difat_sectors))
+        total_sectors = content_sectors + num_fat_sectors + num_difat_sectors
+
+        # Extend the FAT to describe every sector, marking FAT/DIFAT sectors.
+        while len(self.fat) < total_sectors:
+            self.fat.append(SectorType.FREESECT)
+        for sid in fat_sector_ids:
+            self.fat[sid] = SectorType.FATSECT
+        for sid in difat_sector_ids:
+            self.fat[sid] = SectorType.DIFSECT
+
+        # The header holds the first 109 FAT locations; any overflow goes into
+        # the DIFAT sector chain.
+        header_fat_locs = fat_sector_ids[:HEADER_DIFAT_SLOTS]
+        overflow_fat_locs = fat_sector_ids[HEADER_DIFAT_SLOTS:]
+        difat_start = difat_sector_ids[0] if difat_sector_ids else SectorType.ENDOFCHAIN
 
         # Write header
-        self._write_header(f, dir_sectors[0], fat_sector_ids, mini_fat_start_sector, num_mini_fat_sectors)
+        self._write_header(f, dir_sectors[0], header_fat_locs, num_fat_sectors,
+                           mini_fat_start_sector, num_mini_fat_sectors,
+                           difat_start, num_difat_sectors)
 
         # Write all sectors in order
         # Collect all sectors by ID
@@ -294,19 +325,32 @@ class CFBWriter:
         # Add FAT sectors
         fat_data = struct.pack(f'<{len(self.fat)}I', *self.fat)
         # Pad to fill all FAT sectors
-        fat_data += struct.pack(f'<I', SectorType.FREESECT) * (num_fat_sectors * fat_entries_per_sector - len(self.fat))
+        fat_data += struct.pack('<I', SectorType.FREESECT) * (num_fat_sectors * fat_entries_per_sector - len(self.fat))
 
         for i, sector_id in enumerate(fat_sector_ids):
             start = i * self.sector_size
             end = start + self.sector_size
             sector_data[sector_id] = fat_data[start:end]
 
+        # Add DIFAT sectors: 127 FAT locations followed by the next DIFAT
+        # sector id (or ENDOFCHAIN for the last one).
+        for j, sector_id in enumerate(difat_sector_ids):
+            locs = overflow_fat_locs[j * difat_entries_per_sector:(j + 1) * difat_entries_per_sector]
+            entries = list(locs)
+            entries += [SectorType.FREESECT] * (difat_entries_per_sector - len(entries))
+            if j < len(difat_sector_ids) - 1:
+                entries.append(difat_sector_ids[j + 1])
+            else:
+                entries.append(SectorType.ENDOFCHAIN)
+            sector_data[sector_id] = struct.pack(f'<{fat_entries_per_sector}I', *entries)
+
         # Write sectors in order
         for sector_id in sorted(sector_data.keys()):
             f.write(sector_data[sector_id])
 
     def _write_header(self, f: BinaryIO, dir_start_sector: int, fat_sectors: List[int],
-                      mini_fat_start: int, num_mini_fat_sectors: int):
+                      num_fat_sectors: int, mini_fat_start: int, num_mini_fat_sectors: int,
+                      difat_start: int, num_difat_sectors: int):
         """Write CFB header (512 bytes)"""
         # Signature
         f.write(self.HEADER_SIGNATURE)
@@ -332,11 +376,11 @@ class CFBWriter:
         # Reserved (6 bytes)
         f.write(b'\x00' * 6)
 
-        # Total sectors (0 for version 3)
+        # Number of directory sectors (0 for version 3)
         f.write(struct.pack('<I', 0))
 
-        # FAT sectors
-        f.write(struct.pack('<I', len(fat_sectors)))
+        # Number of FAT sectors (total, including any indexed via DIFAT sectors)
+        f.write(struct.pack('<I', num_fat_sectors))
 
         # First directory sector
         f.write(struct.pack('<I', dir_start_sector))
@@ -353,13 +397,13 @@ class CFBWriter:
         # Number of mini FAT sectors
         f.write(struct.pack('<I', num_mini_fat_sectors))
 
-        # First DIFAT sector (0xFFFFFFFE = no DIFAT)
-        f.write(struct.pack('<I', SectorType.ENDOFCHAIN))
+        # First DIFAT sector (ENDOFCHAIN when the 109 header slots suffice)
+        f.write(struct.pack('<I', difat_start))
 
         # Number of DIFAT sectors
-        f.write(struct.pack('<I', 0))
+        f.write(struct.pack('<I', num_difat_sectors))
 
-        # DIFAT array (109 entries, 4 bytes each = 436 bytes)
+        # DIFAT array: the first up to 109 FAT sector locations (436 bytes)
         for i in range(109):
             if i < len(fat_sectors):
                 f.write(struct.pack('<I', fat_sectors[i]))

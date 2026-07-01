@@ -21,15 +21,26 @@ from pymsgkit.properties import (
 from pymsgkit.types import PropertyType
 
 
-def test_unicode_encoding_is_utf16le_null_terminated():
+def test_unicode_stream_has_no_null_terminator():
+    # MSG string streams store the raw string; the null terminator is omitted
+    # from the stream and only counted in the property-table size.
     out = encode_property_value("Hi", PropertyType.PT_UNICODE)
-    assert out == "Hi".encode("utf-16le") + b"\x00\x00"
+    assert out == "Hi".encode("utf-16le")
+    assert not out.endswith(b"\x00\x00")
+
+
+def test_unicode_table_size_counts_terminator():
+    p = Property(PropertyTag.PR_SUBJECT, PropertyType.PT_UNICODE, "Hi")
+    size = struct.unpack("<I", p.get_entry()[8:12])[0]
+    # 2 chars * 2 bytes + 2-byte UTF-16 null terminator
+    assert size == 6
 
 
 def test_string8_replaces_unmappable_chars():
-    # CJK cannot be represented in cp1252; must not raise.
+    # CJK cannot be represented in cp1252; must not raise and must not append a
+    # stream null terminator.
     out = encode_property_value("会", PropertyType.PT_STRING8)
-    assert out.endswith(b"\x00")
+    assert isinstance(out, bytes) and not out.endswith(b"\x00")
 
 
 def test_long_and_short_encoding():
